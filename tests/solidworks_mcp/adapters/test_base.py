@@ -132,3 +132,36 @@ async def test_base_default_sketch_helpers_return_error() -> None:
 
     result = await adapter.sketch_offset(["e1"], 1.0, False)
     assert result.status == AdapterResultStatus.ERROR
+
+    result = await adapter.sketch_trim("e1", 5.0, 0.0)
+    assert result.status == AdapterResultStatus.ERROR
+
+
+@pytest.mark.asyncio
+async def test_base_default_assembly_component_lookup_returns_error() -> None:
+    """Default assembly lookup must fail explicitly rather than use GUI state."""
+    adapter = _Adapter({})
+
+    result = await adapter.get_assembly_component("FixturePart-1")
+
+    assert result.status == AdapterResultStatus.ERROR
+
+
+@pytest.mark.asyncio
+async def test_base_default_surface_body_listing_returns_error() -> None:
+    """Base adapters explicitly report unsupported surface inspection."""
+    adapter = _Adapter({})
+
+    result = await adapter.list_surface_bodies()
+
+    assert result.status == AdapterResultStatus.ERROR
+
+
+@pytest.mark.asyncio
+async def test_base_default_drawing_view_outline_returns_error() -> None:
+    """Base adapters explicitly report unsupported drawing layout inspection."""
+    adapter = _Adapter({})
+
+    result = await adapter.get_drawing_view_outline("Drawing View1")
+
+    assert result.status == AdapterResultStatus.ERROR

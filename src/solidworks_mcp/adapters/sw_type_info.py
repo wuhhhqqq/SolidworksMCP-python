@@ -50,8 +50,17 @@ except ImportError:
 # SolidWorks type library IID (stable across SW versions).
 SW_TLB_IID = "{83A33D31-27C5-11CE-BFD4-00400513BB57}"
 
+# SolidWorks 2019 through 3DEXPERIENCE R2026x.  Keep the installed version
+# first so an existing makepy wrapper is found without regenerating it.
+SUPPORTED_TLB_MAJORS: tuple[int, ...] = (35, 34, 33, 32, 31, 30, 29, 28, 27)
+# Older SolidWorks dispatches become unstable when every inherited interface
+# member is probed through ``_FlagAsMethod``. Retain their type information
+# for capability checks, but leave their dynamic dispatch unmodified.
+METHOD_FLAGGING_MIN_TLB_MAJOR = 30
+
 # Module state: populated by _load_wrapper() the first time it's needed.
 _wrapper_module: Any | None = None
+_wrapper_major: int | None = None
 _interface_methods: dict[str, frozenset[str]] = {}
 # Per-object record of which interfaces have already been flagged. Keyed by
 # id(obj) so ``flag_methods(doc, 'IModelDoc2')`` followed by
@@ -64,32 +73,36 @@ def _load_wrapper() -> None:
 
     Tries ``GetModuleForTypelib`` first (fast path, no COM work), falls back
     to ``EnsureModule`` (may trigger makepy generation), then gives up and
-    logs a warning. Probes common SW major versions (33..30) because the
-    minor/major numbers change per SW year.
+    logs a warning. Probes supported SW major versions because the type
+    library major number changes each release.
     """
-    global _wrapper_module, _interface_methods
+    global _wrapper_major, _wrapper_module, _interface_methods
 
     if not PYWIN32_AVAILABLE:  # pragma: no cover
         return
 
-    # Try version numbers from newest to oldest. SW 3DEXPERIENCE R2026x = 34,
-    # SW 2025 = 33, SW 2024 = 32, SW 2023 = 31, SW 2022 = 30.
-    for major in (35, 34, 33, 32, 31, 30):
+    _wrapper_major = None
+
+    # SW 2019 = 27, SW 2020 = 28, SW 2021 = 29, SW 2022 = 30,
+    # SW 2023 = 31, SW 2024 = 32, SW 2025 = 33, and newer releases follow.
+    for major in SUPPORTED_TLB_MAJORS:
         try:
             mod = gencache.GetModuleForTypelib(SW_TLB_IID, 0, major, 0)
         except Exception:
             mod = None
         if mod is not None:
             _wrapper_module = mod
+            _wrapper_major = major
             break
 
     if _wrapper_module is None:  # pragma: no cover
         # Gen_py wrapper not generated yet — try to generate now.
-        for major in (35, 34, 33, 32, 31, 30):
+        for major in SUPPORTED_TLB_MAJORS:
             try:
                 gencache.EnsureModule(SW_TLB_IID, 0, major, 0)
                 _wrapper_module = gencache.GetModuleForTypelib(SW_TLB_IID, 0, major, 0)
                 if _wrapper_module is not None:
+                    _wrapper_major = major
                     break
             except Exception:
                 continue
@@ -145,6 +158,21 @@ def interface_method_names(interface: str) -> frozenset[str]:
     return _interface_methods.get(interface, frozenset())
 
 
+def interface_supports_method(interface: str, method_name: str) -> bool | None:
+    """Return whether loaded type information declares a COM method.
+
+    ``None`` means type information is unavailable, so callers can retain
+    their existing optimistic dynamic-dispatch fallback.  This distinction is
+    important because ``CDispatch`` can return a callable proxy for an unknown
+    method and defer ``Member not found`` until invocation.
+    """
+    _ensure_loaded()
+    methods = _interface_methods.get(interface)
+    if methods is None:
+        return None
+    return method_name in methods
+
+
 # Interface sets most tool operations need to flag. When acquiring a doc
 # dispatch, always flag IModelDoc2 (base) plus the subclass that matches the
 # doc type. For the app root, flag ISldWorks.
@@ -177,6 +205,11 @@ def flag_methods(obj: Any, *interfaces: str) -> int:
 
     if not _interface_methods or obj is None:  # pragma: no cover
         return 0
+    if (
+        _wrapper_major is not None
+        and _wrapper_major < METHOD_FLAGGING_MIN_TLB_MAJOR
+    ):  # pragma: no cover - requires a legacy SolidWorks installation
+        return 0
 
     obj_id = id(obj)
     already = _flag_cache.setdefault(obj_id, set())
@@ -202,6 +235,26 @@ def flag_methods(obj: Any, *interfaces: str) -> int:
 
     already.update(new_interfaces)
     return flagged
+
+
+def flag_method(obj: Any, interface: str, method_name: str) -> bool:
+    """Mark one known COM method without probing an entire interface.
+
+    This is used for legacy SolidWorks dispatches where bulk method flagging
+    is unsafe, but a specific zero-argument method is otherwise mistaken for
+    a property by pywin32.
+    """
+    _ensure_loaded()
+    if (
+        obj is None
+        or method_name not in _interface_methods.get(interface, frozenset())
+    ):
+        return False
+    try:
+        obj._FlagAsMethod(method_name)
+    except Exception:
+        return False
+    return True
 
 
 def flagged(obj: Any, *interfaces: str) -> Any:

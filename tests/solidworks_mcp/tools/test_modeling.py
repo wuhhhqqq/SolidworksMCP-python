@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import pytest
 
 from solidworks_mcp.tools.modeling import (
+    AddChamferInput,
     AddFilletInput,
     CloseModelInput,
     CreateAssemblyInput,
@@ -32,10 +33,101 @@ class TestModelingTools:
         tool_count = await register_modeling_tools(
             mcp_server, mock_adapter, mock_config
         )
-        assert tool_count == 12
+        assert tool_count == 16
         # The Phase 1 sweep/loft tools must be registered alongside the rest.
         names = {tool.name for tool in await mcp_server.list_tools()}
-        assert {"create_sweep", "create_loft"} <= names
+        assert {
+            "add_chamfer",
+            "create_sweep",
+            "create_loft",
+            "get_selection_state",
+            "list_open_models",
+        } <= names
+
+    @pytest.mark.asyncio
+    async def test_get_selection_state_success(
+        self, mcp_server, mock_adapter, mock_config
+    ):
+        """The public tool returns a concise serializable selection snapshot."""
+        await register_modeling_tools(mcp_server, mock_adapter, mock_config)
+        mock_adapter.get_selection_state = AsyncMock(
+            return_value=Mock(
+                is_success=True,
+                data={
+                    "count": 1,
+                    "truncated": False,
+                    "items": [{"index": 1, "object_type": 21, "mark": 0}],
+                },
+                execution_time=0.03,
+            )
+        )
+        tool = next(
+            tool for tool in await mcp_server.list_tools() if tool.name == "get_selection_state"
+        )
+
+        result = await tool.fn()
+
+        assert result == {
+            "status": "success",
+            "message": "Read 1 selected object(s)",
+            "selection": {
+                "count": 1,
+                "truncated": False,
+                "items": [{"index": 1, "object_type": 21, "mark": 0}],
+            },
+            "execution_time": 0.03,
+        }
+
+    @pytest.mark.asyncio
+    async def test_get_selection_state_failure(
+        self, mcp_server, mock_adapter, mock_config
+    ):
+        """Adapter errors are exposed as actionable MCP tool errors."""
+        await register_modeling_tools(mcp_server, mock_adapter, mock_config)
+        mock_adapter.get_selection_state = AsyncMock(
+            return_value=Mock(is_success=False, error="No active model")
+        )
+        tool = next(
+            tool for tool in await mcp_server.list_tools() if tool.name == "get_selection_state"
+        )
+
+        result = await tool.fn()
+
+        assert result == {
+            "status": "error",
+            "message": "Failed to read selection state: No active model",
+        }
+
+    @pytest.mark.asyncio
+    async def test_list_open_models_success(
+        self, mcp_server, mock_adapter, mock_config
+    ):
+        """The open-document listing is read-only and serializable."""
+        await register_modeling_tools(mcp_server, mock_adapter, mock_config)
+        mock_adapter.list_open_models = AsyncMock(
+            return_value=Mock(
+                is_success=True,
+                data=[
+                    {
+                        "title": "Bracket",
+                        "path": "C:/Models/Bracket.SLDPRT",
+                        "type": "Part",
+                        "configuration": "Default",
+                        "is_active": True,
+                    }
+                ],
+                execution_time=0.02,
+            )
+        )
+        tool = next(
+            tool for tool in await mcp_server.list_tools() if tool.name == "list_open_models"
+        )
+
+        result = await tool.fn()
+
+        assert result["status"] == "success"
+        assert result["count"] == 1
+        assert result["models"][0]["title"] == "Bracket"
 
     @pytest.mark.asyncio
     async def test_open_model_success(self, mcp_server, mock_adapter, mock_config):
@@ -238,6 +330,40 @@ class TestModelingTools:
         assert result["status"] == "success"
         assert result["revolve"]["angle"] == 360.0
         assert result["revolve"]["direction"] == "one_direction"
+
+    @pytest.mark.asyncio
+    async def test_add_chamfer_success(self, mcp_server, mock_adapter, mock_config):
+        """add_chamfer passes explicit edge references to the adapter."""
+        await register_modeling_tools(mcp_server, mock_adapter, mock_config)
+        mock_adapter.add_chamfer = AsyncMock(
+            return_value=Mock(
+                is_success=True,
+                data={"feature_name": "Chamfer1"},
+                execution_time=0.4,
+            )
+        )
+        tool = {
+            registered.name: registered.fn
+            for registered in await mcp_server.list_tools()
+        }
+
+        result = await tool["add_chamfer"](
+            AddChamferInput(distance=1.5, edge_names=["Edge<1>", "Edge<2>"])
+        )
+
+        assert result == {
+            "status": "success",
+            "message": "Created chamfer: Chamfer1",
+            "chamfer": {
+                "name": "Chamfer1",
+                "distance": 1.5,
+                "edges": ["Edge<1>", "Edge<2>"],
+            },
+            "execution_time": 0.4,
+        }
+        mock_adapter.add_chamfer.assert_awaited_once_with(
+            1.5, ["Edge<1>", "Edge<2>"]
+        )
 
     @pytest.mark.asyncio
     async def test_create_sweep_success(self, mcp_server, mock_adapter, mock_config):
@@ -639,10 +765,10 @@ class TestModelingTools:
         assert "Dimension name is required" in set_result["message"]
 
     @pytest.mark.asyncio
-    async def test_create_cut_extrude_and_add_fillet_failure_paths(
+    async def test_create_cut_extrude_fillet_and_chamfer_failure_paths(
         self, mcp_server, mock_adapter, mock_config
     ):
-        """create_cut_extrude and add_fillet surface adapter error messages."""
+        """Feature tools surface their adapter error messages."""
         await register_modeling_tools(mcp_server, mock_adapter, mock_config)
 
         mock_adapter.create_cut_extrude = AsyncMock(
@@ -650,6 +776,9 @@ class TestModelingTools:
         )
         mock_adapter.add_fillet = AsyncMock(
             return_value=Mock(is_success=False, error="fillet radius too large")
+        )
+        mock_adapter.add_chamfer = AsyncMock(
+            return_value=Mock(is_success=False, error="chamfer intersects a face")
         )
 
         tool = {
@@ -666,3 +795,18 @@ class TestModelingTools:
         )
         assert fillet_result["status"] == "error"
         assert "fillet radius too large" in fillet_result["message"]
+
+        chamfer_result = await tool["add_chamfer"](
+            AddChamferInput(distance=1.0, edge_names=["Edge<1>"])
+        )
+        assert chamfer_result["status"] == "error"
+        assert "chamfer intersects a face" in chamfer_result["message"]
+
+    def test_add_chamfer_input_rejects_invalid_geometry(self) -> None:
+        """Chamfer requests require a positive distance and explicit edges."""
+        with pytest.raises(ValueError, match="distance"):
+            AddChamferInput(distance=0.0, edge_names=["Edge<1>"])
+        with pytest.raises(ValueError, match="at least 1 item"):
+            AddChamferInput(distance=1.0, edge_names=[])
+        with pytest.raises(ValueError, match="empty edge"):
+            AddChamferInput(distance=1.0, edge_names=[" "])

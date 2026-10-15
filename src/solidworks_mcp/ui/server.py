@@ -18,6 +18,8 @@ GITHUB_API_KEY environment variable with models:read scope
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from pathlib import Path as FilePath
 from typing import Any
@@ -33,6 +35,7 @@ from .routers import docs as docs_router
 from .routers import llm as llm_router
 from .routers import local_model as local_model_router
 from .routers import model as model_router
+from .routers import panel as panel_router
 from .routers import preview as preview_router
 from .routers import session as session_router
 from .routers import viewer as viewer_router
@@ -55,7 +58,9 @@ from .services import (  # noqa: F401  (re-exported for monkeypatching in tests)
     update_ui_preferences,
 )
 
-UI_LOG_DIR = FilePath(".solidworks_mcp") / "ui_logs"
+UI_LOG_DIR = FilePath(
+    os.getenv("SOLIDWORKS_UI_LOG_DIR", str(FilePath(".solidworks_mcp") / "ui_logs"))
+)
 UI_HTTP_LOG_FILE = UI_LOG_DIR / "ui_http.log"
 _UI_FILE_SINK_ID: int | None = None
 
@@ -71,17 +76,34 @@ def _configure_ui_file_logging() -> None:
     if _UI_FILE_SINK_ID is not None:
         return
 
-    UI_LOG_DIR.mkdir(parents=True, exist_ok=True)
-    _UI_FILE_SINK_ID = logger.add(
-        str(UI_HTTP_LOG_FILE),
-        level="INFO",
-        rotation="10 MB",
-        retention="14 days",
-        encoding="utf-8",
-        enqueue=True,
-        filter=lambda record: "[ui." in record["message"],
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {message}",
-    )
+    try:
+        UI_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _UI_FILE_SINK_ID = logger.add(
+            str(UI_HTTP_LOG_FILE),
+            level="INFO",
+            rotation="10 MB",
+            retention="14 days",
+            encoding="utf-8",
+            enqueue=True,
+            filter=lambda record: "[ui." in record["message"],
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {message}",
+        )
+    except OSError as exc:
+        # Stale test folders or enterprise ACLs must not prevent the panel API
+        # from starting. Fall back to the per-user temporary directory.
+        fallback = FilePath(tempfile.gettempdir()) / "solidworks_mcp" / "ui_logs"
+        fallback.mkdir(parents=True, exist_ok=True)
+        _UI_FILE_SINK_ID = logger.add(
+            str(fallback / "ui_http.log"),
+            level="INFO",
+            rotation="10 MB",
+            retention="14 days",
+            encoding="utf-8",
+            enqueue=True,
+            filter=lambda record: "[ui." in record["message"],
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {message}",
+        )
+        logger.warning("[ui.logging] using fallback log directory after {}", exc)
     logger.info(
         "[ui.logging] file sink enabled path={}", str(UI_HTTP_LOG_FILE.resolve())
     )
@@ -97,7 +119,12 @@ def _should_log_request(path: str) -> bool:
         bool: True if should log request, otherwise False.
     """
 
-    return path == "/api/health" or path.startswith("/api/ui/")
+    return (
+        path == "/api/health"
+        or path.startswith("/api/ui/")
+        or path.startswith("/api/panel/")
+        or path == "/panel"
+    )
 
 
 def _sanitize_log_payload(value: Any) -> Any:
@@ -292,6 +319,15 @@ app.include_router(checkpoint_router.router)
 app.include_router(docs_router.router)
 app.include_router(local_model_router.router)
 app.include_router(viewer_router.router)
+app.include_router(panel_router.router)
+
+
+@app.on_event("shutdown")
+async def _shutdown_panel_runtime() -> None:
+    """Release the panel adapter while leaving SolidWorks and user documents open."""
+    from .panel_runtime import get_panel_runtime
+
+    await get_panel_runtime().close()
 
 
 @app.get("/api/health")

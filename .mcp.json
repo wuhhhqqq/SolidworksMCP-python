@@ -7,10 +7,7 @@
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        ".\\run-mcp.ps1",
-        "--real",
-        "--year",
-        "2026"
+        ".\\run-mcp-stdio.ps1"
       ]
     }
   }

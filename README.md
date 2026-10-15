@@ -6,7 +6,62 @@
 [![SolidWorks](https://img.shields.io/badge/SolidWorks-2019--2026-red)](https://www.solidworks.com/)
 [![Coverage](https://codecov.io/gh/andrewbartels1/SolidworksMCP-python/branch/main/graph/badge.svg)](https://codecov.io/gh/andrewbartels1/SolidworksMCP-python)
 
-Python MCP server for SolidWorks automation with 109 tools, plus an optional agent/prompt-testing layer for AI-assisted workflows.
+Python MCP server for SolidWorks automation with 255 tools, plus an optional agent/prompt-testing layer for AI-assisted workflows.
+
+Current implementation boundaries, validation evidence, and remaining closure work:
+[功能实现与闭环审计（2026-10-14）](docs/planning/functional-closure-audit-2026-10-14.md).
+Tool registration counts do not imply real SolidWorks execution coverage.
+
+Latest reliability update: [1.0.2 会话与启动收口](docs/user-guide/release-1.0.2.md).
+Real COM automation is owned by one MCP process per Windows user; a second
+stdio/panel process must wait for the owner to disconnect.
+
+## MCP Client Package
+
+The project is installable as the `solidworks-mcp-python` Python package and includes
+a pure stdio launcher for MCP clients. Use `run-mcp-stdio.ps1` from the project
+root; it attaches only to an already-running SolidWorks instance and never
+launches or closes SolidWorks itself. The repository `.mcp.json` is configured
+for this launcher.
+
+Build distributable artifacts with:
+
+```powershell
+uv build
+```
+
+Use `run-mcp.ps1` only for the local development HTTP/demo workflow. It writes
+human-readable startup output and is intentionally not used as an MCP stdio
+entrypoint.
+
+### DXF To SolidWorks Part
+
+`import_dxf_to_part` creates a new native `.sldprt` from a basic DXF. It imports
+model-space `LINE`, `ARC`, `CIRCLE`, `LWPOLYLINE`, and `POLYLINE` geometry into a
+sketch on the selected Front, Top, or Right plane. Set `extrusion_depth_mm` to
+create a solid; omit it to retain a sketch-only part. Coordinates are converted
+from DXF units to millimetres.
+
+Call `validate_dxf_geometry` to preflight a file without opening or changing
+SolidWorks. It reports duplicate/overlapping linework, zero-size entities,
+open and branching profiles, and non-endpoint line crossings. Import performs
+the same validation by default: geometry errors stop the import, while an open,
+branching, or intersecting profile stops an extrusion. Set
+`validate_geometry=false` only when deliberately importing an unvalidated
+sketch. Arc intersections are reported as an analysis limitation rather than
+approximated, so an arc-containing DXF is not automatically cleared for
+extrusion by the DXF layer. When `extrusion_depth_mm` is set, the imported
+sketch is then checked by SolidWorks itself using `ISketch.CheckFeatureUse` for
+a boss extrusion; native errors such as self-intersection, zero-length geometry,
+and invalid contour combinations stop the extrusion. The standalone
+`check_sketch_feature_use` tool exposes the same SolidWorks check for an
+existing sketch and also supports base/surface/cut extrude contexts.
+
+Direct `.dwg` input is intentionally rejected. Convert DWG first to a basic DXF
+(for example, the `export_caxa_2015_dxf` R12 output) so proxy entities, blocks,
+dimensions, and application-specific objects cannot create incomplete geometry.
+By default unsupported DXF entities also produce an error; use `strict=false`
+only when intentionally importing the supported geometry and ignoring the rest.
 
 ## Overview
 
@@ -32,6 +87,19 @@ It includes:
 - Windows + SolidWorks COM automation for the main CAD lifecycle.
 - Modeling, sketching, drawing, analysis, export, automation, templates, and macro tools.
 - Prefab UI preview sync from the active viewport as PNG.
+- Optional embedded SolidWorks Task Pane that discovers all registered MCP tools,
+  renders their JSON-Schema parameters, and runs them through the same local MCP runtime.
+
+### Embedded Task Pane
+
+Run `./run-panel.ps1` to start the local-only panel bridge at
+`http://127.0.0.1:8766/panel`. The source add-in and registration helpers are in
+[`addin/`](addin/); setup instructions are in
+[the embedded Task Pane guide](docs/getting-started/embedded-task-pane.md). The
+panel also exposes an explicit **启动 SolidWorks** action (and
+`POST /api/panel/start-solidworks`) that launches an installed desktop instance
+and waits for COM registration; ordinary panel loading and MCP calls remain
+attach-only.
 
 ## Not Yet / Simulated
 
@@ -139,17 +207,15 @@ Set your user MCP config (`%APPDATA%\Code\User\mcp.json`) to:
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        "C:\\path\\to\\SolidworksMCP-python\\run-mcp.ps1",
-        "--real",
-        "--year",
-        "2026"
+        "C:\\path\\to\\SolidworksMCP-python\\run-mcp-stdio.ps1"
       ]
+    }
   },
   "inputs": []
 }
 ```
 
-Replace the script path with your local repository path.  The `--real --year 2026` flags start the server in live COM automation mode (requires SolidWorks open).  Omit them for mock mode.
+Replace the script path with your local repository path. Start SolidWorks normally before connecting the MCP client.
 
 ## LM Studio MCP Configuration (Windows)
 
@@ -165,7 +231,7 @@ Set your LM Studio MCP config file to include this server (LM Studio expects `mc
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        "C:\\Users\\andre\\OneDrive\\Documents\\GitHub\\SolidworksMCP-python\\run-mcp.ps1"
+        "C:\\path\\to\\SolidworksMCP-python\\run-mcp-stdio.ps1"
       ]
     }
   }

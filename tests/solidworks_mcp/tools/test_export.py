@@ -7,7 +7,7 @@ from fastmcp import FastMCP
 
 from solidworks_mcp.tools.export import (
     BatchExportInput,
-    ExportDWGInput,
+    ExportDrawingCadInput,
     ExportIGESInput,
     ExportImageInput,
     ExportPDFInput,
@@ -24,7 +24,7 @@ class TestExportTools:
     async def test_register_export_tools(self, mcp_server, mock_adapter, mock_config):
         """Test that export tools register correctly."""
         tool_count = await register_export_tools(mcp_server, mock_adapter, mock_config)
-        assert tool_count == 7
+        assert tool_count == 10
 
     @pytest.mark.asyncio
     async def test_export_step_success(self, mcp_server, mock_adapter, mock_config):
@@ -192,7 +192,7 @@ class TestExportTools:
         """Test successful DWG export."""
         await register_export_tools(mcp_server, mock_adapter, mock_config)
 
-        mock_adapter.export_dwg = AsyncMock(
+        mock_adapter.export_drawing_cad = AsyncMock(
             return_value=Mock(
                 is_success=True,
                 data={
@@ -206,11 +206,10 @@ class TestExportTools:
             )
         )
 
-        input_data = ExportDWGInput(
-            drawing_path="test_drawing.slddrw",
-            output_path="exports/test_drawing.dwg",
-            autocad_version="2020",
-            layer_mapping=True,
+        input_data = ExportDrawingCadInput(
+            file_path="exports/test_drawing.dwg",
+            format_type="dwg",
+            model_space=True,
         )
 
         tool_func = None
@@ -223,9 +222,44 @@ class TestExportTools:
         result = await tool_func(input_data=input_data)
 
         assert result["status"] == "success"
-        assert result["data"]["export_file"] == "test_drawing.dwg"
-        assert result["data"]["autocad_version"] == "2020"
-        mock_adapter.export_dwg.assert_called_once()
+        assert result["export"]["file_path"] == "exports/test_drawing.dwg"
+        assert result["export"]["space"] == "model"
+        mock_adapter.export_drawing_cad.assert_awaited_once_with(
+            "exports/test_drawing.dwg", "dwg", True
+        )
+
+        dxf_tool = next(
+            tool.fn for tool in await mcp_server.list_tools() if tool.name == "export_dxf"
+        )
+        dxf_result = await dxf_tool(
+            ExportDrawingCadInput(
+                file_path="exports/test_drawing.dxf",
+                format_type="dxf",
+                model_space=False,
+            )
+        )
+        assert dxf_result["status"] == "success"
+        assert dxf_result["export"]["space"] == "paper"
+        assert mock_adapter.export_drawing_cad.await_args_list[-1].args == (
+            "exports/test_drawing.dxf",
+            "dxf",
+            False,
+        )
+
+        caxa_tool = next(
+            tool.fn
+            for tool in await mcp_server.list_tools()
+            if tool.name == "export_caxa_2015_dxf"
+        )
+        caxa_result = await caxa_tool({"file_path": "exports/caxa2015.dxf"})
+        assert caxa_result["status"] == "success"
+        assert caxa_result["export"]["format"] == "DXF R12"
+        assert mock_adapter.export_drawing_cad.await_args_list[-1].args == (
+            "exports/caxa2015.dxf",
+            "dxf",
+            True,
+            "caxa_2015",
+        )
 
     @pytest.mark.asyncio
     async def test_export_image_success(self, mcp_server, mock_adapter, mock_config):
@@ -425,7 +459,7 @@ class TestExportToolsBranchCoverage:
         mock_adapter.export_pdf = AsyncMock(
             return_value=Mock(is_success=False, error="pdf failed", execution_time=0.1)
         )
-        mock_adapter.export_dwg = AsyncMock(
+        mock_adapter.export_drawing_cad = AsyncMock(
             return_value=Mock(is_success=False, error="dwg failed", execution_time=0.1)
         )
         # exercise default fallback message branches where error is missing
@@ -448,7 +482,7 @@ class TestExportToolsBranchCoverage:
             input_data=ExportPDFInput(model_path="a.slddrw", output_path="a.pdf")
         )
         r4 = await by_name["export_dwg"](
-            input_data=ExportDWGInput(model_path="a.slddrw", output_path="a.dwg")
+            input_data=ExportDrawingCadInput(file_path="a.dwg", format_type="dwg")
         )
         r5 = await by_name["export_image"](
             input_data=ExportImageInput(model_path="a.sldprt", output_path="a.png")
@@ -483,7 +517,9 @@ class TestExportToolsBranchCoverage:
         mock_adapter.export_iges = AsyncMock(side_effect=RuntimeError("boom iges"))
         mock_adapter.export_stl = AsyncMock(side_effect=RuntimeError("boom stl"))
         mock_adapter.export_pdf = AsyncMock(side_effect=RuntimeError("boom pdf"))
-        mock_adapter.export_dwg = AsyncMock(side_effect=RuntimeError("boom dwg"))
+        mock_adapter.export_drawing_cad = AsyncMock(
+            side_effect=RuntimeError("boom dwg")
+        )
         mock_adapter.export_image = AsyncMock(side_effect=RuntimeError("boom image"))
         mock_adapter.batch_export = AsyncMock(side_effect=RuntimeError("boom batch"))
 
@@ -500,7 +536,7 @@ class TestExportToolsBranchCoverage:
                 ExportPDFInput(model_path="a.slddrw", output_path="a.pdf")
             ),
             await by_name["export_dwg"](
-                ExportDWGInput(model_path="a.slddrw", output_path="a.dwg")
+                ExportDrawingCadInput(file_path="a.dwg", format_type="dwg")
             ),
             await by_name["export_image"](
                 ExportImageInput(model_path="a.sldprt", output_path="a.png")

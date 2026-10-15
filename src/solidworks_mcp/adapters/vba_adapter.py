@@ -251,13 +251,14 @@ class VbaGeneratorAdapter:
         return (
             "Sub CreateSweep()\n"
             "    ' Auto-generated VBA fallback snippet\n"
+            f"    ' Profile: {params.profile or 'inferred'}\n"
             f"    ' Path: {params.path}\n"
             "End Sub"
         )
 
     async def execute_macro(
         self,
-        macro_code: str,
+        macro_code: str | dict[str, Any],
         macro_name: str = "GeneratedMacro",
         subroutine: str = "Main",
     ) -> AdapterResult[Any]:
@@ -271,6 +272,11 @@ class VbaGeneratorAdapter:
         Returns:
             AdapterResult[Any]: The result produced by the operation.
         """
+        if isinstance(macro_code, dict):
+            # Typed callers execute only a manifest-provisioned .swp path through the
+            # underlying COM adapter.  Do not stage it as source text.
+            return await self._backing_adapter.execute_macro(macro_code)
+
         request = MacroExecutionRequest(
             macro_code=macro_code,
             macro_name=macro_name,

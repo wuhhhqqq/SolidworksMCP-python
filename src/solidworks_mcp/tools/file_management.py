@@ -215,6 +215,10 @@ class PackAndGoInput(CompatInput):
         default=False,
         description="Overwrite files that already exist in target_dir",
     )
+    name_prefix: str = Field(
+        default="",
+        description="Optional prefix applied to every copied assembly and part filename",
+    )
 
 
 class ListFeaturesInput(CompatInput):
@@ -1525,6 +1529,7 @@ async def register_file_management_tools(
             result = await adapter.pack_and_go_assembly(  # type: ignore[attr-defined]
                 source_path=str(source),
                 target_dir=str(out_dir),
+                name_prefix=input_data.name_prefix,
             )
 
             if not result.is_success:

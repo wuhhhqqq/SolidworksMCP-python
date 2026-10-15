@@ -319,6 +319,9 @@ class TestSolidWorksMCPServer:
 
         # Setup server
         mock_adapter = Mock()
+        mock_adapter.close_all_session_docs = AsyncMock(
+            return_value=SimpleNamespace(is_error=False)
+        )
         mock_adapter.disconnect = AsyncMock()
 
         with patch("solidworks_mcp.utils.validate_environment"):
@@ -336,10 +339,30 @@ class TestSolidWorksMCPServer:
         # Stop server
         await server.stop()
 
-        # Verify cleanup
+        # A stdio client restart must not close documents the user just created.
+        mock_adapter.close_all_session_docs.assert_not_awaited()
         mock_adapter.disconnect.assert_called_once()
         assert server.state.is_connected is False
         assert server._setup_complete is False
+
+    @pytest.mark.asyncio
+    async def test_server_stop_closes_session_documents_only_when_explicitly_enabled(
+        self, mock_config
+    ):
+        """Opt-in cleanup remains available for controlled test/worker processes."""
+        mock_config.close_session_documents_on_shutdown = True
+        server = SolidWorksMCPServer(mock_config)
+        mock_adapter = Mock()
+        mock_adapter.close_all_session_docs = AsyncMock(
+            return_value=SimpleNamespace(is_error=False)
+        )
+        mock_adapter.disconnect = AsyncMock()
+        server.adapter = mock_adapter
+
+        await server.stop()
+
+        mock_adapter.close_all_session_docs.assert_awaited_once()
+        mock_adapter.disconnect.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_server_local_mode_start(self, mock_config):

@@ -45,6 +45,29 @@ def test_from_env_parses_json_list_fields(
     assert config.api_keys == ["alpha", "beta"]
 
 
+def test_trusted_macro_configuration_defaults_and_validates_bounds(tmp_path) -> None:
+    """Trusted macro settings should be opt-in and derive their safe default root."""
+    config = SolidWorksMCPConfig(data_dir=tmp_path)
+    assert config.enable_trusted_macros is False
+    assert config.model_input_dir == tmp_path / "inputs"
+    assert config.trusted_macro_dir == tmp_path / "trusted_macros"
+    assert config.macro_confirmation_ttl_seconds == 300
+
+    with pytest.raises(ValidationError):
+        SolidWorksMCPConfig(macro_confirmation_ttl_seconds=29)
+    with pytest.raises(ValidationError):
+        SolidWorksMCPConfig(trusted_macro_max_bytes=0)
+
+
+def test_model_input_dir_must_stay_beneath_data_dir(tmp_path) -> None:
+    """The typed model input root cannot expand server file-system read scope."""
+    with pytest.raises(ValidationError, match="model_input_dir"):
+        SolidWorksMCPConfig(
+            data_dir=tmp_path / "data",
+            model_input_dir=tmp_path / "outside-inputs",
+        )
+
+
 def test_from_env_invalid_json_list_bubbles_to_validation(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

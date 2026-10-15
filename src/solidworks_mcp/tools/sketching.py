@@ -4,7 +4,7 @@ Provides tools for creating and editing sketches, including geometric entities l
 lines, circles, rectangles, arcs, and constraints.
 """
 
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from fastmcp import FastMCP
 from loguru import logger
@@ -318,6 +318,21 @@ class CheckSketchDefinitionInput(CompatInput):
     sketch_name: str | None = Field(
         default=None,
         description="Optional sketch name. If omitted, checks the active or last sketch.",
+    )
+
+
+class CheckSketchFeatureUseInput(CompatInput):
+    """Input schema for native SolidWorks feature-use validation."""
+
+    sketch_name: str | None = Field(
+        default=None,
+        description="Optional sketch name. If omitted, checks the active or last sketch.",
+    )
+    feature_use: Literal[
+        "base_extrude", "boss_extrude", "surface_extrude", "cut_extrude"
+    ] = Field(
+        default="boss_extrude",
+        description="SolidWorks feature context used to validate sketch contours",
     )
 
 
@@ -730,6 +745,46 @@ async def register_sketching_tools(
                 "status": "error",
                 "message": f"Unexpected error: {str(e)}",
             }
+
+    @mcp.tool()
+    async def check_sketch_feature_use(
+        input_data: CheckSketchFeatureUseInput | None = None,
+    ) -> dict[str, Any]:
+        """Use the SolidWorks kernel to validate a sketch for a target feature.
+
+        Unlike constraint-state inspection, this calls ``ISketch.CheckFeatureUse``
+        and reports native contour errors such as self-intersections, zero-length
+        entities, and invalid open/closed contour combinations.
+        """
+        try:
+            normalized = _normalize_input(
+                input_data or {}, CheckSketchFeatureUseInput
+            )
+            result = await adapter.check_sketch_feature_use(
+                normalized.sketch_name, normalized.feature_use
+            )
+            if not result.is_success:
+                return {
+                    "status": "error",
+                    "message": f"Failed to validate sketch feature use: {result.error}",
+                }
+            payload = result.data or {}
+            if payload.get("is_valid"):
+                message = "SolidWorks reports the sketch is valid for the requested feature."
+            else:
+                message = (
+                    "SolidWorks reports the sketch is not valid for the requested feature: "
+                    f"{payload.get('status', 'unknown')}"
+                )
+            return {
+                "status": "success",
+                "message": message,
+                "validation": payload,
+                "execution_time": result.execution_time,
+            }
+        except Exception as exc:
+            logger.error("Error in check_sketch_feature_use tool: {}", exc)
+            return {"status": "error", "message": f"Unexpected error: {exc}"}
 
     @mcp.tool()
     async def add_arc(input_data: AddArcInput) -> dict[str, Any]:

@@ -11,6 +11,7 @@ import time
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import pytest_asyncio
@@ -302,10 +303,10 @@ def test_discovery_connect_fails_on_non_windows(
     assert discovery.connect_to_solidworks() is False
 
 
-def test_discovery_connect_uses_dispatch_when_getobject_none(
+def test_discovery_connect_requires_an_existing_solidworks_instance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Connect_to_solidworks should fall back to gencache.EnsureDispatch when GetActiveObject raises com_error."""
+    """Discovery must not create SolidWorks when no active object exists."""
     import solidworks_mcp.tools.docs_discovery as docs_mod
 
     fake_sw = object()
@@ -326,7 +327,9 @@ def test_discovery_connect_uses_dispatch_when_getobject_none(
                 GetActiveObject=lambda _: (_ for _ in ()).throw(
                     _FakeComError("not running")
                 ),
-                gencache=SimpleNamespace(EnsureDispatch=lambda _: fake_sw),
+                gencache=SimpleNamespace(
+                    EnsureDispatch=Mock(return_value=fake_sw)
+                ),
             )
         ),
         raising=False,
@@ -335,8 +338,9 @@ def test_discovery_connect_uses_dispatch_when_getobject_none(
     discovery = docs_mod.SolidWorksDocsDiscovery(
         output_dir=Path("tests/.generated/docs-connect-dispatch")
     )
-    assert discovery.connect_to_solidworks() is True
-    assert discovery.sw_app is fake_sw
+    assert discovery.connect_to_solidworks() is False
+    assert discovery.sw_app is None
+    docs_mod.win32com.client.gencache.EnsureDispatch.assert_not_called()
 
 
 def test_discover_com_objects_empty_without_connection() -> None:
@@ -510,6 +514,38 @@ async def test_discover_solidworks_docs_tool_error_paths(
 
 
 @pytest.mark.asyncio
+async def test_discover_solidworks_docs_does_not_start_com_in_testing_mode(
+    mcp_server,
+    mock_config: SolidWorksMCPConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Testing mode must not attempt to launch or attach to SolidWorks COM."""
+    import solidworks_mcp.tools.docs_discovery as docs_mod
+
+    mock_config.testing = True
+    await register_docs_discovery_tools(mcp_server, object(), mock_config)
+
+    discover_tool = next(
+        tool.fn
+        for tool in await mcp_server.list_tools()
+        if tool.name == "discover_solidworks_docs"
+    )
+
+    monkeypatch.setattr(docs_mod, "HAS_WIN32COM", True)
+    monkeypatch.setattr(docs_mod.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(
+        docs_mod,
+        "SolidWorksDocsDiscovery",
+        lambda *_args, **_kwargs: pytest.fail("COM discovery must not be constructed"),
+    )
+
+    result = await discover_tool({})
+
+    assert result["status"] == "error"
+    assert "configured for testing" in result["message"]
+
+
+@pytest.mark.asyncio
 async def test_discover_solidworks_docs_tool_success_path(
     mcp_server,
     mock_config: SolidWorksMCPConfig,
@@ -574,7 +610,7 @@ async def test_discover_solidworks_docs_tool_success_path(
 
 
 def test_discovery_connect_handles_com_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Connect_to_solidworks should return False when both GetActiveObject and EnsureDispatch raise com_error."""
+    """Connect_to_solidworks should return False when no active object is found."""
     import solidworks_mcp.tools.docs_discovery as docs_mod
 
     class _FakeComError(Exception):
@@ -591,11 +627,7 @@ def test_discovery_connect_handles_com_error(monkeypatch: pytest.MonkeyPatch) ->
         SimpleNamespace(
             client=SimpleNamespace(
                 GetActiveObject=lambda _: (_ for _ in ()).throw(_FakeComError("boom")),
-                gencache=SimpleNamespace(
-                    EnsureDispatch=lambda _: (_ for _ in ()).throw(
-                        _FakeComError("boom")
-                    )
-                ),
+                gencache=SimpleNamespace(EnsureDispatch=Mock()),
             )
         ),
         raising=False,
@@ -605,6 +637,7 @@ def test_discovery_connect_handles_com_error(monkeypatch: pytest.MonkeyPatch) ->
         output_dir=Path("tests/.generated/docs-connect-com-error")
     )
     assert discovery.connect_to_solidworks() is False
+    docs_mod.win32com.client.gencache.EnsureDispatch.assert_not_called()
 
 
 def test_discover_com_objects_handles_attribute_and_catalog_errors() -> None:

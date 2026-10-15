@@ -674,6 +674,19 @@ class TestConnectionPoolAdapterCoverage:
 
         await pool.disconnect()
 
+    @pytest.mark.asyncio
+    async def test_create_configuration_via_pool(self):
+        """Test configuration creation via a pooled adapter."""
+        pool = _make_pool(pool_size=1)
+        await pool.connect()
+        await pool.create_part("config_coverage")
+
+        result = await pool.create_configuration("Fabrication", "Coverage test")
+
+        assert result.status == AdapterResultStatus.SUCCESS
+        assert result.data == "Fabrication"
+        await pool.disconnect()
+
 
 # ===========================================================================
 # TestConnectionPoolLegacyCoverage

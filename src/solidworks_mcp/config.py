@@ -152,6 +152,13 @@ class SolidWorksMCPConfig(BaseModel):
         description="SolidWorks release year hint (e.g., 2025, 2026)",
     )
 
+    solidworks_startup_timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        le=300,
+        description="Maximum time to wait for an explicitly launched SolidWorks COM server",
+    )
+
     adapter_type: AdapterType = Field(
         default=AdapterType.PYWIN32,
         description="SolidWorks adapter implementation to use",
@@ -164,6 +171,11 @@ class SolidWorksMCPConfig(BaseModel):
     # === Feature Flags ===
     enable_macro_recording: bool = Field(
         default=True, description="Enable VBA macro recording capabilities"
+    )
+
+    enable_trusted_macros: bool = Field(
+        default=False,
+        description="Enable execution of administrator-provisioned, hash-confirmed VBA projects",
     )
 
     enable_pdm: bool = Field(
@@ -212,6 +224,26 @@ class SolidWorksMCPConfig(BaseModel):
     data_dir: Path = Field(
         default_factory=lambda: Path.home() / ".solidworks_mcp",
         description="Data directory for persistent storage",
+    )
+
+    model_input_dir: Path | None = Field(
+        default=None,
+        description="Trusted directory containing native SolidWorks input models",
+    )
+
+    trusted_macro_dir: Path | None = Field(
+        default=None,
+        description="Administrator-controlled directory containing trusted .swp macro manifests",
+    )
+
+    trusted_macro_max_bytes: int = Field(
+        default=20 * 1024 * 1024,
+        description="Maximum accepted size of one trusted VBA project",
+    )
+
+    macro_confirmation_ttl_seconds: int = Field(
+        default=300,
+        description="Lifetime of a trusted-macro confirmation before it must be prepared again",
     )
 
     state_file: str | None = Field(
@@ -299,6 +331,14 @@ class SolidWorksMCPConfig(BaseModel):
 
     circuit_breaker_timeout: int = Field(
         default=60, description="Circuit breaker timeout in seconds"
+    )
+
+    close_session_documents_on_shutdown: bool = Field(
+        default=False,
+        description=(
+            "Close documents created or opened by this MCP process when the server "
+            "stops. Disabled by default so a stdio client restart never closes a user's work."
+        ),
     )
 
     # === Additional Test Configuration Fields ===
@@ -392,6 +432,39 @@ class SolidWorksMCPConfig(BaseModel):
             return data_dir / "cache"
         return v
 
+    @field_validator("model_input_dir")
+    @classmethod
+    def set_model_input_dir(cls, v: Path | None, info: ValidationInfo) -> Path:
+        """Set the trusted native-model input directory beneath the data directory."""
+        data_dir = cast(
+            Path,
+            info.data.get("data_dir", Path.home() / ".solidworks_mcp"),
+        )
+        if v is None:
+            return data_dir / "inputs"
+        if str(v).startswith(("\\\\", "//")):
+            raise ValueError("model_input_dir must not use a UNC path")
+        try:
+            input_root = v.expanduser().resolve()
+            data_root = data_dir.expanduser().resolve()
+        except OSError as exc:
+            raise ValueError("model_input_dir could not be resolved safely") from exc
+        if not input_root.is_relative_to(data_root):
+            raise ValueError("model_input_dir must be beneath data_dir")
+        return input_root
+
+    @field_validator("trusted_macro_dir")
+    @classmethod
+    def set_trusted_macro_dir(cls, v: Path | None, info: ValidationInfo) -> Path:
+        """Set the trusted macro directory beneath the configured data directory."""
+        if v is None:
+            data_dir = cast(
+                Path,
+                info.data.get("data_dir", Path.home() / ".solidworks_mcp"),
+            )
+            return data_dir / "trusted_macros"
+        return v
+
     @field_validator("log_file")
     @classmethod
     def set_log_file(cls, v: Path | None, info: ValidationInfo) -> Path:
@@ -460,6 +533,22 @@ class SolidWorksMCPConfig(BaseModel):
         """
         if v <= 0:
             raise ValueError("timeout_seconds must be > 0")
+        return v
+
+    @field_validator("trusted_macro_max_bytes")
+    @classmethod
+    def validate_trusted_macro_max_bytes(cls, v: int) -> int:
+        """Require a positive, bounded administrator macro-size limit."""
+        if v < 1 or v > 100 * 1024 * 1024:
+            raise ValueError("trusted_macro_max_bytes must be between 1 and 104857600")
+        return v
+
+    @field_validator("macro_confirmation_ttl_seconds")
+    @classmethod
+    def validate_macro_confirmation_ttl_seconds(cls, v: int) -> int:
+        """Require short-lived, positive macro confirmations."""
+        if v < 30 or v > 3600:
+            raise ValueError("macro_confirmation_ttl_seconds must be between 30 and 3600")
         return v
 
     @field_validator("complexity_parameter_threshold")
@@ -601,6 +690,10 @@ class SolidWorksMCPConfig(BaseModel):
             self.cache_dir = self.data_dir / "cache"
         if self.log_file is None:
             self.log_file = self.data_dir / "logs" / "server.log"
+        if self.model_input_dir is None:
+            self.model_input_dir = self.data_dir / "inputs"
+        if self.trusted_macro_dir is None:
+            self.trusted_macro_dir = self.data_dir / "trusted_macros"
 
         # Ensure data directories exist
         self.data_dir.mkdir(parents=True, exist_ok=True)

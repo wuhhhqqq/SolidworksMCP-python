@@ -21,7 +21,6 @@ from .input_compat import CompatInput
 
 try:
     import win32com.client
-    from pywintypes import com_error
 
     HAS_WIN32COM = True
 except ImportError:  # pragma: no cover
@@ -403,7 +402,7 @@ class SolidWorksDocsDiscovery:
         }
 
     def connect_to_solidworks(self) -> bool:
-        """Connect to running SolidWorks instance.
+        """Attach to a running SolidWorks instance without starting one.
 
         Returns:
             bool: True if connect to solidworks, otherwise False.
@@ -417,22 +416,21 @@ class SolidWorksDocsDiscovery:
             return False
 
         try:
-            # Prefer GetActiveObject so we attach to a running SolidWorks session.
-            # EnsureDispatch is used (instead of Dispatch) so that the type library
-            # is loaded and pythoncom ITypeInfo enumeration works correctly.
-            try:
-                self.sw_app = win32com.client.GetActiveObject("SldWorks.Application")
-            except com_error:
-                logger.warning(
-                    "SolidWorks not running; attempting to create new instance"
-                )
-                self.sw_app = win32com.client.gencache.EnsureDispatch(
-                    "SldWorks.Application"
-                )
-            return True
-        except com_error as e:
-            logger.error(f"Failed to connect to SolidWorks: {e}")
+            self.sw_app = win32com.client.GetActiveObject("SldWorks.Application")
+        except Exception as exc:
+            logger.error(
+                "No running SolidWorks instance is available for discovery. "
+                "Start SolidWorks from the desktop shortcut and retry: {}",
+                exc,
+            )
             return False
+        if self.sw_app is None:
+            logger.error(
+                "No running SolidWorks instance is available for discovery. "
+                "Start SolidWorks from the desktop shortcut and retry."
+            )
+            return False
+        return True
 
     def discover_com_objects(self) -> dict[str, Any]:
         """Discover all COM objects and their methods/properties.
@@ -1002,6 +1000,12 @@ async def register_docs_discovery_tools(
         import time
 
         start_time = time.time()
+
+        if bool(getattr(config, "testing", False)):
+            return {
+                "status": "error",
+                "message": "COM documentation discovery is unavailable while the server is configured for testing.",
+            }
 
         if not HAS_WIN32COM:
             return {

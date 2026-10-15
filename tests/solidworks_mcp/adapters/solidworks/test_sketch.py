@@ -82,6 +82,59 @@ def test_create_sketch_requires_active_model() -> None:
     assert result.error == "No active model"
 
 
+def test_sketch_split_open_and_closed_segments_use_metre_coordinates() -> None:
+    adapter = _FakeSketchAdapter()
+    segment = SimpleNamespace(Select4=Mock(return_value=True))
+    adapter._sketch_entities = {"Line_1": segment, "Arc_1": segment}
+    manager = SimpleNamespace(
+        SplitOpenSegment=Mock(return_value=True),
+        SplitClosedSegment=Mock(return_value=True),
+    )
+    adapter.currentSketchManager = manager
+    adapter.currentModel = SimpleNamespace(
+        ClearSelection2=Mock(),
+        SelectionManager=SimpleNamespace(
+            CreateSelectData=lambda: SimpleNamespace(Mark=0)
+        ),
+    )
+
+    open_result = sketch._sketch_split_impl(adapter, "Line_1", 10, 20, 0, False, None, None, None)
+    closed_result = sketch._sketch_split_impl(adapter, "Arc_1", 10, 20, 0, True, 30, 40, 50)
+
+    assert open_result.is_success
+    assert closed_result.is_success
+    manager.SplitOpenSegment.assert_called_once_with(0.01, 0.02, 0.0)
+    manager.SplitClosedSegment.assert_called_once_with(0.01, 0.02, 0.0, 0.03, 0.04, 0.05)
+    assert adapter.currentModel.ClearSelection2.call_count >= 4
+
+
+def test_sketch_fillet_and_chamfer_select_two_entities_and_clear_selection() -> None:
+    adapter = _FakeSketchAdapter()
+    first = SimpleNamespace(Select4=Mock(return_value=True))
+    second = SimpleNamespace(Select4=Mock(return_value=True))
+    adapter._sketch_entities = {"Line_1": first, "Line_2": second}
+    manager = SimpleNamespace(
+        SketchFillet=Mock(return_value=True),
+        SketchChamfer=Mock(return_value=True),
+    )
+    adapter.currentSketchManager = manager
+    adapter.currentModel = SimpleNamespace(
+        ClearSelection2=Mock(),
+        SelectionManager=SimpleNamespace(
+            CreateSelectData=lambda: SimpleNamespace(Mark=0)
+        ),
+    )
+
+    fillet_result = sketch._sketch_fillet_impl(adapter, ["Line_1", "Line_2"], 2.5)
+    chamfer_result = sketch._sketch_chamfer_impl(adapter, ["Line_1", "Line_2"], 1.5, 45)
+
+    assert fillet_result.is_success
+    assert chamfer_result.is_success
+    manager.SketchFillet.assert_called_once_with(0.0025)
+    manager.SketchChamfer.assert_called_once_with(0.0015, 0.0015, 0)
+    assert adapter.currentModel.ClearSelection2.call_count >= 4
+
+
 def test_create_sketch_selects_feature_plane_and_uses_named_sketch() -> None:
     adapter = _FakeSketchAdapter()
     plane_feature = SimpleNamespace(Select2=lambda _append, _mark: True)
@@ -136,6 +189,50 @@ def test_create_sketch_falls_back_to_select_by_id_and_generated_name() -> None:
     assert result.data == "Sketch_1"
     assert adapter._last_sketch_name == "Sketch_1"
     assert calls["n"] >= 1
+
+
+def test_create_sketch_captures_native_sketch_when_insert_returns_boolean() -> None:
+    """A truthy InsertSketch result must not hide the active ISketch object."""
+    adapter = _FakeSketchAdapter()
+    plane_feature = SimpleNamespace(Select2=lambda _append, _mark: True)
+    native_sketch = SimpleNamespace(CheckFeatureUse=lambda *_args: 0)
+    adapter.currentModel = SimpleNamespace(
+        FeatureByName=lambda _name: plane_feature,
+        Extension=SimpleNamespace(SelectByID2=lambda *args, **kwargs: False),
+        SketchManager=SimpleNamespace(InsertSketch=lambda *_args: True),
+        GetActiveSketch2=lambda: native_sketch,
+    )
+
+    result = sketch._create_sketch_impl(adapter, "Front")
+
+    assert result.is_success
+    assert adapter.currentSketch is native_sketch
+    assert adapter._last_sketch_object is native_sketch
+
+
+def test_create_sketch_uses_active_doc_extension_when_model_dispatch_omits_it() -> None:
+    """New derived document dispatches can hide the inherited Extension member."""
+
+    class _DerivedPartDispatch:
+        FeatureByName = staticmethod(lambda _name: None)
+        SketchManager = SimpleNamespace(
+            InsertSketch=lambda *_args: SimpleNamespace(Name="SketchA")
+        )
+        GetActiveSketch2 = staticmethod(lambda: None)
+
+        @property
+        def Extension(self) -> object:
+            raise RuntimeError("Member not found")
+
+    adapter = _FakeSketchAdapter()
+    extension = SimpleNamespace(SelectByID2=Mock(return_value=True))
+    adapter.currentModel = _DerivedPartDispatch()
+    adapter.swApp = SimpleNamespace(ActiveDoc=SimpleNamespace(Extension=extension))
+
+    result = sketch._create_sketch_impl(adapter, "Front")
+
+    assert result.status == AdapterResultStatus.SUCCESS
+    extension.SelectByID2.assert_called_once()
 
 
 def test_create_sketch_reports_plane_selection_failure() -> None:
@@ -201,6 +298,7 @@ def test_spline_centerline_polygon_and_ellipse_paths() -> None:
         CreateCenterLine=lambda *args: object(),
         CreatePolygon=lambda *args: object(),
         CreateEllipse=lambda *args: object(),
+        CreateText=lambda *args: object(),
     )
 
     spline_ok = sketch._add_spline_impl(
@@ -222,9 +320,11 @@ def test_spline_centerline_polygon_and_ellipse_paths() -> None:
     center_ok = sketch._add_centerline_impl(adapter, 0, 0, 10, 0)
     polygon_ok = sketch._add_polygon_impl(adapter, 0, 0, 10, 6)
     ellipse_ok = sketch._add_ellipse_impl(adapter, 0, 0, 10, 4)
+    text_ok = sketch._add_sketch_text_impl(adapter, "MCP", 5, 6, 3, 30)
     assert center_ok.is_success and center_ok.data.startswith("Centerline_")
     assert polygon_ok.is_success and polygon_ok.data.startswith("Polygon_")
     assert ellipse_ok.is_success and ellipse_ok.data.startswith("Ellipse_")
+    assert text_ok.is_success and text_ok.data.startswith("SketchText_")
 
 
 def test_spline_error_when_create_returns_none() -> None:
@@ -927,3 +1027,89 @@ def test_check_sketch_fully_defined_handles_textual_probe_values() -> None:
     result = sketch._check_sketch_fully_defined_impl(adapter, None)
     assert result.is_success
     assert result.data["definition_state"] == "fully_defined"
+
+
+def test_check_sketch_feature_use_reports_native_status_and_contours() -> None:
+    """ISketch.CheckFeatureUse results are exposed without losing contour counts."""
+    adapter = _FakeSketchAdapter()
+
+    def _valid_feature_use(_feature_type, open_count, closed_count):
+        open_count.value = 1
+        closed_count.value = 2
+        return 0
+
+    sketch_obj = SimpleNamespace(CheckFeatureUse=_valid_feature_use)
+    feature_obj = SimpleNamespace(GetSpecificFeature2=lambda: sketch_obj)
+    adapter.currentModel = SimpleNamespace(FeatureByName=lambda _name: feature_obj)
+
+    result = sketch._check_sketch_feature_use_impl(adapter, "Sketch1", "boss_extrude")
+
+    assert result.is_success
+    assert result.data == {
+        "sketch_name": "Sketch1",
+        "feature_use": "boss_extrude",
+        "feature_type": 3,
+        "is_valid": True,
+        "status_code": 0,
+        "status": "ok",
+        "open_contour_count": 1,
+        "closed_contour_count": 2,
+        "source": "ISketch.CheckFeatureUse",
+    }
+
+    def _rejected_feature_use(_feature_type, open_count, closed_count):
+        open_count.value = 0
+        closed_count.value = 0
+        return 2
+
+    sketch_obj.CheckFeatureUse = _rejected_feature_use
+    rejected = sketch._check_sketch_feature_use_impl(adapter, "Sketch1", "boss_extrude")
+    assert rejected.is_success
+    assert rejected.data["is_valid"] is False
+    assert rejected.data["status"] == "self_intersection"
+
+
+def test_check_sketch_feature_use_falls_back_to_captured_native_sketch() -> None:
+    """Use the native sketch when a synthetic name is not in the feature tree."""
+    adapter = _FakeSketchAdapter()
+
+    def _valid_feature_use(_feature_type, open_count, closed_count):
+        open_count.value = 0
+        closed_count.value = 1
+        return 0
+
+    native_sketch = SimpleNamespace(CheckFeatureUse=_valid_feature_use)
+    adapter._last_sketch_object = native_sketch
+    adapter.currentModel = SimpleNamespace(FeatureByName=lambda _name: None)
+
+    result = sketch._check_sketch_feature_use_impl(adapter, "Sketch_1", "boss_extrude")
+
+    assert result.is_success
+    assert result.data["is_valid"] is True
+    assert result.data["closed_contour_count"] == 1
+
+
+def test_check_sketch_feature_use_resolves_latest_profile_feature() -> None:
+    """Localized feature names fall back to the latest ProfileFeature."""
+    adapter = _FakeSketchAdapter()
+
+    def _valid_feature_use(_feature_type, open_count, closed_count):
+        open_count.value = 0
+        closed_count.value = 1
+        return 0
+
+    native_sketch = SimpleNamespace(CheckFeatureUse=_valid_feature_use)
+    profile_feature = SimpleNamespace(
+        GetTypeName2=lambda: "ProfileFeature",
+        GetSpecificFeature2=lambda: native_sketch,
+    )
+    adapter.currentModel = SimpleNamespace(
+        FeatureByName=lambda _name: None,
+        FeatureByPositionReverse=lambda position: profile_feature if position == 0 else None,
+    )
+
+    result = sketch._check_sketch_feature_use_impl(adapter, "Sketch_1", "boss_extrude")
+
+    assert result.is_success
+    assert result.data["is_valid"] is True
+    assert result.data["closed_contour_count"] == 1

@@ -135,6 +135,7 @@ async def refresh_preview(
     active_model_path = active_model_path_override or metadata.get("active_model_path")
     adapter = adapter_override
     owns_adapter = adapter_override is None
+    adapter_released = False
 
     try:
         if not active_model_path:
@@ -236,10 +237,12 @@ async def refresh_preview(
 
         if owns_adapter:
             await adapter.disconnect()
+            adapter_released = True
 
         # --- Step 3: Export per-orientation PNG thumbnails ---
         VIEW_ORIENTATIONS = ["isometric", "front", "top", "right"]
         preview_view_urls: dict[str, str] = {}
+        adapter2: Any | None = None
         try:
             config2 = load_config()
             adapter2 = await create_adapter(config2)
@@ -302,11 +305,16 @@ async def refresh_preview(
                         view_name,
                         str(_ve),
                     )
-            await adapter2.disconnect()
         except Exception as _views_exc:
             logger.warning(
                 "[ui.refresh_preview] multi-view export failed: {}", str(_views_exc)
             )
+        finally:
+            if adapter2 is not None:
+                try:
+                    await adapter2.disconnect()
+                except Exception:
+                    logger.debug("[ui.refresh_preview] orientation adapter disconnect failed")
 
         # Preserve existing view URLs when a refresh attempt returns no images.
         existing_view_urls = metadata.get("preview_view_urls")
@@ -342,6 +350,11 @@ async def refresh_preview(
         )
     except Exception as exc:
         logger.exception("[ui.refresh_preview] failed: {}", exc)
+        if owns_adapter and adapter is not None and not adapter_released:
+            try:
+                await adapter.disconnect()
+            except Exception:
+                logger.debug("[ui.refresh_preview] adapter disconnect failed after error")
         insert_tool_call_record(
             session_id=session_id,
             tool_name="export_image",

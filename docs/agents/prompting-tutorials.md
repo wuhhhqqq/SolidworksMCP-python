@@ -364,7 +364,8 @@ Name the macro "create_gear.swp".
       {"type": "gear", "module": 2, "teeth": 20, "pressure_angle": 20, "face_width": 15}
     ]
   }},
-  {"tool": "execute_macro", "args": {"macro_path": "C:\\Temp\\create_gear.swp"}}
+  {"tool": "solidworks_prepare_trusted_macro", "args": {"session_id": "<session>", "macro_id": "create_gear"}},
+  {"tool": "solidworks_execute_trusted_macro", "args": {"session_id": "<session>", "confirmation_id": "<confirmation>", "macro_sha256": "<reviewed-sha256>"}}
 ]
 ```
 

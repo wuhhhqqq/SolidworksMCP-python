@@ -359,7 +359,7 @@ This returns a validated `ReconstructionPlan` JSON — a structured, typed plan 
 | `Sketch is still active` | `exit_sketch()` was not called | Always call `exit_sketch()` before any feature creation |
 | `Plane not found: "front"` | Wrong capitalisation | Must be `"Front"`, `"Top"`, or `"Right"` |
 | `Extrusion failed: sketch not closed` | Profile has a gap | Ask LLM to identify the gap and add the missing line |
-| `create_loft is not implemented` | Loft tool not yet in MCP | Use `generate_vba_part_modeling` + `execute_macro` |
+| `SW_SKETCH_NOT_READY` from sweep/loft | A profile, path, or guide was not created and exited in this workflow session | Create and exit every required sketch, then pass only the returned sketch references |
 | Depth is 1000× too large | Units mismatch | Pass mm values > 0.5; server auto-normalises |
 | `RecoverableFailure` from agent CLI | Schema validation failed | Re-run with `--max-retries-on-recoverable 2` |
 

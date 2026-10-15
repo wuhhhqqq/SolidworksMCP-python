@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "solidworks-mcp-python"
-version = "1.0.0"
+version = "1.0.2"
 description = "SolidWorks MCP Server with FastMCP and PydanticAI - Python Implementation"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,7 +30,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "fastmcp>=3.2.2",
+    "fastmcp>=3.2.2,<3.4",
     "pydantic>=2.5.0",
     "pydantic-ai>=0.0.13",
     "sqlmodel>=0.0.22",
@@ -38,6 +38,7 @@ dependencies = [
     "pywin32>=306; platform_system=='Windows'",
     "pywin32-ctypes>=0.2.0; platform_system=='Windows'",
     "comtypes>=1.4.0; platform_system=='Windows'",
+    "ezdxf>=1.4.0,<2",
     "loguru>=0.7.0",
     "typing-extensions>=4.8.0",
     "httpx>=0.24.0",
@@ -134,6 +135,9 @@ solidworks-mcp = "solidworks_mcp.server:cli_main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/solidworks_mcp"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"src/solidworks_mcp/ui/panel/index.html" = "solidworks_mcp/ui/panel/index.html"
+
 [tool.hatch.build.targets.sdist]
 include = [
     "/src",
@@ -143,6 +147,12 @@ include = [
     "/README.md",
     "/LICENSE",
     "/pyproject.toml",
+    "/addin",
+    "/run-panel.ps1",
+    "/run-mcp-stdio.ps1",
+    "/mcp-config-stdio.json",
+    "/INSTALL-外部用户.ps1",
+    "/INSTALL-外部用户.md",
 ]
 
 [tool.pytest.ini_options]

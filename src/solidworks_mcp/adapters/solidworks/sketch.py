@@ -9,6 +9,7 @@ from typing import Any, cast
 
 from .. import sw_type_info as _sw_type_info
 from ..base import AdapterResult, AdapterResultStatus
+from .io import SolidWorksIOMixin
 
 # swConstraintType_e values per the official SolidWorks API enum docs
 # (SolidWorks.Interop.swconst). The legacy IModelDoc2.SketchAddConstraints
@@ -32,6 +33,40 @@ RELATION_NAME_MAP: dict[str, int] = {
 # Relations that take a third entity (the centerline of symmetry for now).
 # All other relations reject a non-null ``entity3``.
 _THREE_ENTITY_RELATIONS: frozenset[str] = frozenset({"symmetric"})
+
+_SKETCH_FEATURE_USE_TYPES = {
+    "base_extrude": 1,
+    "boss_extrude": 3,
+    "surface_extrude": 5,
+    "cut_extrude": 11,
+}
+_SKETCH_FEATURE_USE_STATUS = {
+    -1: "unknown_error",
+    0: "ok",
+    1: "entity_intersection",
+    2: "self_intersection",
+    3: "invalid_entity",
+    4: "three_entities_at_point",
+    5: "empty_sketch",
+    6: "wrong_open_contour_count",
+    7: "wrong_contour_count",
+    8: "zero_length_entity",
+    9: "multiple_open_contours",
+    10: "no_open_contour",
+    11: "mixed_open_and_closed_contours",
+    12: "contour_intersection",
+    13: "disjoint_contours",
+    14: "open_contour_when_closed_required",
+    15: "closed_contour_when_open_required",
+    16: "double_containment",
+    17: "more_than_one_contour",
+    18: "one_open_contour_expected",
+    19: "one_closed_contour_expected",
+    20: "single_open_or_multiple_closed_disjoint_expected",
+    21: "axis_required",
+    22: "open_or_unclear_contour",
+    23: "contour_intersects_centerline",
+}
 
 
 class SolidWorksSketchMixin:
@@ -103,15 +138,31 @@ class SolidWorksSketchMixin:
     async def create_sketch(self, plane: str) -> AdapterResult[str]:
         return _create_sketch_impl(self, plane)
 
+    async def create_3d_sketch(self) -> AdapterResult[str]:
+        return _create_3d_sketch_impl(self)
+
     async def add_line(
         self, x1: float, y1: float, x2: float, y2: float
     ) -> AdapterResult[str]:
         return _add_line_impl(self, x1, y1, x2, y2)
 
+    async def add_3d_line(
+        self, x1: float, y1: float, z1: float, x2: float, y2: float, z2: float
+    ) -> AdapterResult[str]:
+        return _add_3d_line_impl(self, x1, y1, z1, x2, y2, z2)
+
+    async def convert_sketch_entities(
+        self, edge_persistent_references: list[str]
+    ) -> AdapterResult[str]:
+        return _convert_sketch_entities_impl(self, edge_persistent_references)
+
     async def add_circle(
         self, center_x: float, center_y: float, radius: float
     ) -> AdapterResult[str]:
         return _add_circle_impl(self, center_x, center_y, radius)
+
+    async def add_point(self, x: float, y: float) -> AdapterResult[str]:
+        return _add_point_impl(self, x, y)
 
     async def add_rectangle(
         self, x1: float, y1: float, x2: float, y2: float
@@ -146,6 +197,11 @@ class SolidWorksSketchMixin:
         self, center_x: float, center_y: float, major_axis: float, minor_axis: float
     ) -> AdapterResult[str]:
         return _add_ellipse_impl(self, center_x, center_y, major_axis, minor_axis)
+
+    async def add_sketch_text(
+        self, text: str, x: float, y: float, height: float, angle_degrees: float
+    ) -> AdapterResult[str]:
+        return _add_sketch_text_impl(self, text, x, y, height, angle_degrees)
 
     async def add_sketch_constraint(
         self,
@@ -193,6 +249,34 @@ class SolidWorksSketchMixin:
     ) -> AdapterResult[str]:
         return _sketch_offset_impl(self, entities, offset_distance, reverse_direction)
 
+    async def sketch_trim(
+        self, entity_id: str, trim_x: float, trim_y: float
+    ) -> AdapterResult[str]:
+        return _sketch_trim_impl(self, entity_id, trim_x, trim_y)
+
+    async def sketch_split(
+        self,
+        entity_id: str,
+        x: float,
+        y: float,
+        z: float = 0.0,
+        closed: bool = False,
+        x2: float | None = None,
+        y2: float | None = None,
+        z2: float | None = None,
+    ) -> AdapterResult[str]:
+        return _sketch_split_impl(self, entity_id, x, y, z, closed, x2, y2, z2)
+
+    async def sketch_fillet(
+        self, entities: list[str], radius: float
+    ) -> AdapterResult[str]:
+        return _sketch_fillet_impl(self, entities, radius)
+
+    async def sketch_chamfer(
+        self, entities: list[str], distance: float, angle_degrees: float = 45.0
+    ) -> AdapterResult[str]:
+        return _sketch_chamfer_impl(self, entities, distance, angle_degrees)
+
     async def exit_sketch(self) -> AdapterResult[None]:
         return _exit_sketch_impl(self)
 
@@ -200,6 +284,21 @@ class SolidWorksSketchMixin:
         self, sketch_name: str | None = None
     ) -> AdapterResult[dict[str, Any]]:
         return _check_sketch_fully_defined_impl(self, sketch_name)
+
+    async def check_sketch_feature_use(
+        self, sketch_name: str | None = None, feature_use: str = "boss_extrude"
+    ) -> AdapterResult[dict[str, Any]]:
+        return _check_sketch_feature_use_impl(self, sketch_name, feature_use)
+
+
+def _with_selection_cleanup(adapter: Any, operation: Any) -> Any:
+    """Run a sketch-selection operation and always restore a clear COM selection."""
+    try:
+        return operation()
+    finally:
+        adapter._attempt(
+            lambda: adapter.currentModel.ClearSelection2(True), default=None
+        )
 
 
 def _create_sketch_impl(adapter: Any, plane: str) -> AdapterResult[str]:
@@ -254,6 +353,9 @@ def _create_sketch_impl(adapter: Any, plane: str) -> AdapterResult[str]:
         Raises:
             Exception: If no plane candidate could be selected.
         """
+        adapter._attempt(
+            lambda: adapter.currentModel.ClearSelection2(True), default=None
+        )
         plane_name_map = {
             "Top": "Top Plane",
             "Front": "Front Plane",
@@ -293,6 +395,12 @@ def _create_sketch_impl(adapter: Any, plane: str) -> AdapterResult[str]:
             "前視基準面",
             "右視基準面",
         ]
+        # A supplied non-standard plane is a server-resolved feature name.
+        # Do not fall back to an origin plane when it cannot be selected: that
+        # would silently create a sketch on the wrong support plane.
+        if plane not in semantic_plane_aliases:
+            plane_candidates = [actual_plane, plane]
+
         for candidate in plane_candidates:
             if not candidate:
                 continue
@@ -313,8 +421,11 @@ def _create_sketch_impl(adapter: Any, plane: str) -> AdapterResult[str]:
 
         if not selected:
             # SW 2022: callout must be None (empty string causes type mismatch)
+            extension = SolidWorksIOMixin._model_extension(adapter)
+            if extension is None:
+                raise RuntimeError("Active model does not expose a model extension")
             selected, selection_error_candidate = adapter._attempt_with_error(
-                lambda: adapter.currentModel.Extension.SelectByID2(
+                lambda: extension.SelectByID2(
                     actual_plane,
                     "PLANE",
                     0,
@@ -361,6 +472,21 @@ def _create_sketch_impl(adapter: Any, plane: str) -> AdapterResult[str]:
                 lambda: adapter.currentModel.GetActiveSketch2()
             ) or adapter._attempt(lambda: adapter.swApp.ActiveDoc.GetActiveSketch2())
 
+        # InsertSketch can return a boolean even when the sketch was opened.
+        # Prefer the native ISketch object when SolidWorks exposes it so later
+        # feature validation does not depend on a localized tree name.
+        active_sketch = adapter._attempt(
+            lambda: adapter.currentModel.GetActiveSketch2(), default=None
+        ) or adapter._attempt(
+            lambda: adapter.swApp.ActiveDoc.GetActiveSketch2(), default=None
+        )
+        if active_sketch is not None:
+            adapter.currentSketch = active_sketch
+        if adapter.currentSketch is not None and callable(
+            getattr(adapter.currentSketch, "CheckFeatureUse", None)
+        ):
+            adapter._last_sketch_object = adapter.currentSketch
+
         adapter._sketch_count += 1
 
         if adapter.currentSketch and hasattr(adapter.currentSketch, "Name"):
@@ -374,7 +500,10 @@ def _create_sketch_impl(adapter: Any, plane: str) -> AdapterResult[str]:
 
     return cast(
         AdapterResult[str],
-        adapter._handle_com_operation("create_sketch", _sketch_operation),
+        adapter._handle_com_operation(
+            "create_sketch",
+            lambda: _with_selection_cleanup(adapter, _sketch_operation),
+        ),
     )
 
 
@@ -480,6 +609,22 @@ def _add_circle_impl(
     return cast(
         AdapterResult[str],
         adapter._handle_com_operation("add_circle", _circle_operation),
+    )
+
+
+def _add_point_impl(adapter: Any, x: float, y: float) -> AdapterResult[str]:
+    """Add one sketch point for a Hole Wizard location in millimetres."""
+    if not adapter.currentSketchManager:
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="No active sketch")
+
+    def _point_operation() -> str:
+        point = adapter.currentSketchManager.CreatePoint(x / 1000.0, y / 1000.0, 0)
+        if not point:
+            raise Exception("Failed to create sketch point")
+        return adapter._register_sketch_entity("Point", point)  # type: ignore[no-any-return]
+
+    return cast(
+        AdapterResult[str], adapter._handle_com_operation("add_point", _point_operation)
     )
 
 
@@ -931,6 +1076,35 @@ def _add_ellipse_impl(
     return cast(
         AdapterResult[str],
         adapter._handle_com_operation("add_ellipse", _ellipse_operation),
+    )
+
+
+def _add_sketch_text_impl(
+    adapter: Any, text: str, x: float, y: float, height: float, angle_degrees: float
+) -> AdapterResult[str]:
+    """Create sketch text through ``ISketchManager.CreateText``."""
+    if not adapter.currentSketchManager:
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="No active sketch")
+
+    def _text_operation() -> str:
+        creator = getattr(adapter.currentSketchManager, "CreateText", None)
+        if not callable(creator):
+            raise RuntimeError("Active sketch does not support CreateText")
+        sketch_text = creator(
+            text,
+            x / 1000.0,
+            y / 1000.0,
+            0.0,
+            height / 1000.0,
+            math.radians(angle_degrees),
+        )
+        if not sketch_text:
+            raise RuntimeError("SolidWorks did not create sketch text")
+        return cast(str, adapter._register_sketch_entity("SketchText", sketch_text))
+
+    return cast(
+        AdapterResult[str],
+        adapter._handle_com_operation("add_sketch_text", _text_operation),
     )
 
 
@@ -1460,6 +1634,185 @@ def _select_sketch_entities(  # pragma: no cover
             ok = entity.Select4(True, select_data)
             if not ok:
                 raise Exception(f"Failed to select sketch entity '{ent_id}'")
+
+
+def _sketch_trim_impl(
+    adapter: Any, entity_id: str, trim_x: float, trim_y: float
+) -> AdapterResult[str]:
+    """Trim one registered sketch entity using a point in the active sketch.
+
+    ``ISketchManager.SketchTrim5`` is available in newer SolidWorks releases,
+    while older releases expose the equivalent ``SketchTrim`` member. Both
+    APIs use the same trim mode and point arguments. The source entity is
+    selected from the adapter-owned registry, so the operation never relies on
+    an arbitrary selection left in the SolidWorks UI.
+
+    Args:
+        adapter: A connected adapter with an active sketch and model.
+        entity_id: Identifier previously returned by a sketch-creation tool.
+        trim_x: X coordinate of the trim point in millimetres.
+        trim_y: Y coordinate of the trim point in millimetres.
+
+    Returns:
+        The same registered entity ID on success because the sketch segment is
+        modified in place.
+    """
+    if not adapter.currentSketchManager or not adapter.currentModel:
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="No active sketch")
+
+    def _trim_operation() -> str:  # pragma: no cover - exercised via COM fakes
+        adapter.currentModel.ClearSelection2(True)
+        _select_sketch_entities(adapter, [entity_id], mark=0)
+        manager = adapter.currentSketchManager
+        adapter._attempt(
+            lambda: _sw_type_info.flag_methods(manager, "ISketchManager"), default=0
+        )
+        point_m = (trim_x / 1000.0, trim_y / 1000.0, 0.0)
+        errors: list[str] = []
+        for method_name in ("SketchTrim5", "SketchTrim"):
+            try:
+                method = getattr(manager, method_name)
+            except Exception as exc:
+                errors.append(f"{method_name}: {exc}")
+                continue
+            if method is None:
+                continue
+            try:
+                # swSketchTrim_Trim is 0. This deterministic single-entity
+                # trim avoids the UI-style power-trim behavior.
+                result = method(0, *point_m)
+            except Exception as exc:
+                errors.append(f"{method_name}: {exc}")
+                continue
+            if result is False:
+                errors.append(f"{method_name}: returned False")
+                continue
+            return entity_id
+        detail = "; ".join(errors) or "SketchTrim5/SketchTrim is unavailable"
+        raise Exception(f"SolidWorks failed to trim sketch entity '{entity_id}': {detail}")
+
+    return cast(
+        AdapterResult[str],
+        adapter._handle_com_operation(
+            "sketch_trim", lambda: _with_selection_cleanup(adapter, _trim_operation)
+        ),
+    )
+
+
+def _sketch_split_impl(
+    adapter: Any,
+    entity_id: str,
+    x: float,
+    y: float,
+    z: float,
+    closed: bool,
+    x2: float | None,
+    y2: float | None,
+    z2: float | None,
+) -> AdapterResult[str]:
+    """Split a registered open or closed sketch segment at supplied points."""
+    if not adapter.currentSketchManager or not adapter.currentModel:
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="No active sketch")
+
+    def _split_operation() -> str:
+        if entity_id not in adapter._sketch_entities:
+            raise Exception(f"Unknown sketch entity '{entity_id}'")
+        if closed and (x2 is None or y2 is None):
+            raise Exception("closed sketch split requires a second point")
+        adapter.currentModel.ClearSelection2(True)
+        try:
+            _select_sketch_entities(adapter, [entity_id], mark=0)
+            manager = adapter.currentSketchManager
+            if closed:
+                result = manager.SplitClosedSegment(
+                    x / 1000.0,
+                    y / 1000.0,
+                    z / 1000.0,
+                    float(x2) / 1000.0,
+                    float(y2) / 1000.0,
+                    float(z2 or 0.0) / 1000.0,
+                )
+            else:
+                result = manager.SplitOpenSegment(
+                    x / 1000.0, y / 1000.0, z / 1000.0
+                )
+            if result is False:
+                raise Exception("SolidWorks failed to split sketch entity")
+        finally:
+            adapter.currentModel.ClearSelection2(True)
+        return f"Split_{entity_id}_{int(time.time() * 1000) % 10000}"
+
+    return cast(
+        AdapterResult[str],
+        adapter._handle_com_operation("sketch_split", _split_operation),
+    )
+
+
+def _select_corner_entities(adapter: Any, entities: list[str]) -> None:
+    if len(entities) != 2 or len(set(entities)) != 2:
+        raise Exception("sketch corner operation requires two distinct entities")
+    for entity_id in entities:
+        if entity_id not in adapter._sketch_entities:
+            raise Exception(f"Unknown sketch entity '{entity_id}'")
+    _select_sketch_entities(adapter, entities, mark=0)
+
+
+def _sketch_fillet_impl(
+    adapter: Any, entities: list[str], radius: float
+) -> AdapterResult[str]:
+    """Apply ``ISketchManager.SketchFillet`` to two selected entities."""
+    if not adapter.currentSketchManager or not adapter.currentModel:
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="No active sketch")
+
+    def _fillet_operation() -> str:
+        if radius <= 0:
+            raise Exception("sketch fillet radius must be greater than zero")
+        adapter.currentModel.ClearSelection2(True)
+        try:
+            _select_corner_entities(adapter, entities)
+            result = adapter.currentSketchManager.SketchFillet(radius / 1000.0)
+            if result is False:
+                raise Exception("SolidWorks failed to create sketch fillet")
+        finally:
+            adapter.currentModel.ClearSelection2(True)
+        return f"Fillet_{int(time.time() * 1000) % 10000}"
+
+    return cast(
+        AdapterResult[str],
+        adapter._handle_com_operation("sketch_fillet", _fillet_operation),
+    )
+
+
+def _sketch_chamfer_impl(
+    adapter: Any, entities: list[str], distance: float, angle_degrees: float
+) -> AdapterResult[str]:
+    """Apply an equal-distance ``ISketchManager.SketchChamfer`` corner."""
+    if not adapter.currentSketchManager or not adapter.currentModel:
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="No active sketch")
+
+    def _chamfer_operation() -> str:
+        if distance <= 0:
+            raise Exception("sketch chamfer distance must be greater than zero")
+        if not 0 < angle_degrees < 180:
+            raise Exception("sketch chamfer angle must be between 0 and 180 degrees")
+        adapter.currentModel.ClearSelection2(True)
+        try:
+            _select_corner_entities(adapter, entities)
+            # Options=0 requests a distance-based equal chamfer. SW 2019 uses
+            # the first two values as distances when this option is selected.
+            result = adapter.currentSketchManager.SketchChamfer(
+                distance / 1000.0, distance / 1000.0, 0
+            )
+            if result is False:
+                raise Exception("SolidWorks failed to create sketch chamfer")
+        finally:
+            adapter.currentModel.ClearSelection2(True)
+        return f"Chamfer_{int(time.time() * 1000) % 10000}"
+
+    return cast(
+        AdapterResult[str],
+        adapter._handle_com_operation("sketch_chamfer", _chamfer_operation),
+    )
 
 
 def _sketch_linear_pattern_impl(
@@ -2124,6 +2477,130 @@ def _exit_sketch_impl(adapter: Any) -> AdapterResult[None]:
     return cast(AdapterResult[None], result)  # pragma: no cover
 
 
+def _check_sketch_feature_use_impl(
+    adapter: Any,
+    sketch_name: str | None = None,
+    feature_use: str = "boss_extrude",
+) -> AdapterResult[dict[str, Any]]:
+    """Validate a sketch for a specific feature using ``ISketch.CheckFeatureUse``."""
+    if not adapter.currentModel:
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="No active model")
+    feature_type = _SKETCH_FEATURE_USE_TYPES.get(feature_use)
+    if feature_type is None:
+        supported = ", ".join(sorted(_SKETCH_FEATURE_USE_TYPES))
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error=f"Unsupported feature_use {feature_use!r}; supported values: {supported}",
+        )
+
+    def _check() -> dict[str, Any]:
+        def _read_com_member(obj: Any, name: str) -> Any:
+            member = getattr(obj, name, None)
+            if not callable(member):
+                return member
+            try:
+                return member()
+            except Exception:
+                return member
+
+        def _latest_profile_feature() -> Any:
+            """Find the latest sketch when its localized name is unknown."""
+            adapter._attempt(
+                lambda: _sw_type_info.flag_methods(adapter.currentModel, "IModelDoc2"),
+                default=0,
+            )
+            for position in range(4096):
+                feature = adapter._attempt(
+                    lambda position=position: adapter.currentModel.FeatureByPositionReverse(
+                        position
+                    ),
+                    default=None,
+                )
+                if not feature:
+                    break
+                adapter._attempt(
+                    lambda feature=feature: _sw_type_info.flag_methods(feature, "IFeature"),
+                    default=0,
+                )
+                if str(_read_com_member(feature, "GetTypeName2") or "").casefold() == (
+                    "profilefeature"
+                ):
+                    return feature
+            return None
+
+        resolved_name = sketch_name or adapter._last_sketch_name
+        sketch_feature = None
+        sketch_obj = None
+        if resolved_name:
+            sketch_feature = adapter.currentModel.FeatureByName(resolved_name)
+            if sketch_feature:
+                sketch_obj = sketch_feature.GetSpecificFeature2()
+            else:
+                # A synthetic Sketch_N name may not exist in a localized
+                # FeatureManager tree. Resolve the most-recent ProfileFeature
+                # before falling back to an ISketch retained during edit mode.
+                sketch_feature = _latest_profile_feature()
+                if sketch_feature:
+                    sketch_obj = _read_com_member(sketch_feature, "GetSpecificFeature2")
+                else:
+                    last_sketch = getattr(adapter, "_last_sketch_object", None)
+                    if callable(getattr(last_sketch, "CheckFeatureUse", None)):
+                        sketch_obj = last_sketch
+                    else:
+                        raise RuntimeError(f"Sketch not found: {resolved_name}")
+        else:
+            sketch_obj = getattr(adapter, "_last_sketch_object", None) or adapter._attempt(
+                lambda: adapter.currentModel.GetActiveSketch2(), default=None
+            )
+        if sketch_obj is None:
+            raise RuntimeError("No active or named sketch found")
+
+        checker = getattr(sketch_obj, "CheckFeatureUse", None)
+        adapter._attempt(
+            lambda: _sw_type_info.flag_methods(sketch_obj, "ISketch"), default=0
+        )
+        checker = getattr(sketch_obj, "CheckFeatureUse", None)
+        if not callable(checker):
+            raise RuntimeError("This SolidWorks version does not expose ISketch.CheckFeatureUse")
+        try:
+            import pythoncom
+            from win32com.client import VARIANT
+        except ImportError as exc:  # pragma: no cover - real adapter is Windows-only
+            raise RuntimeError("pywin32 is required for native sketch feature validation") from exc
+
+        open_count = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        closed_count = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+        raw = checker(feature_type, open_count, closed_count)
+        values = tuple(raw) if isinstance(raw, (tuple, list)) else (raw,)
+        try:
+            status_code = int(values[0])
+        except (TypeError, ValueError, IndexError) as exc:
+            raise RuntimeError(f"Unexpected CheckFeatureUse result: {raw!r}") from exc
+
+        def _variant_count(value: Any) -> int | None:
+            try:
+                return int(value.value)
+            except (AttributeError, TypeError, ValueError):
+                return None
+
+        return {
+            "sketch_name": resolved_name,
+            "feature_use": feature_use,
+            "feature_type": feature_type,
+            "is_valid": status_code == 0,
+            "status_code": status_code,
+            "status": _SKETCH_FEATURE_USE_STATUS.get(status_code, "unmapped_status"),
+            "open_contour_count": _variant_count(open_count),
+            "closed_contour_count": _variant_count(closed_count),
+            "source": "ISketch.CheckFeatureUse",
+        }
+
+    return cast(
+        AdapterResult[dict[str, Any]],
+        adapter._handle_com_operation("check_sketch_feature_use", _check),
+    )
+
+
 def _check_sketch_fully_defined_impl(
     adapter: Any,
     sketch_name: str | None = None,
@@ -2405,4 +2882,133 @@ def _check_sketch_fully_defined_impl(
         adapter._handle_com_operation(
             "check_sketch_fully_defined", _get_sketch_payload
         ),
+    )
+
+
+def _create_3d_sketch_impl(adapter: Any) -> AdapterResult[str]:
+    """Open a 3D sketch through ``ISketchManager.Insert3DSketch``."""
+    if not adapter.currentModel:
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="No active model")
+
+    def _create() -> str:
+        adapter.currentModel.ClearSelection2(True)
+        manager = adapter.currentModel.SketchManager
+        insert = getattr(manager, "Insert3DSketch", None)
+        if not callable(insert):
+            raise RuntimeError("Active model does not support 3D sketches")
+        try:
+            sketch = insert(True)
+        except TypeError:
+            sketch = insert()
+        adapter.currentSketchManager = manager
+        adapter.currentSketch = sketch or adapter._attempt(
+            lambda: adapter.currentModel.GetActiveSketch2(), default=None
+        )
+        adapter._reset_sketch_entity_registry()
+        adapter._sketch_count += 1
+        name = adapter._attempt(lambda: adapter.currentSketch.Name, default=None)
+        adapter._last_sketch_name = str(name or f"3DSketch_{adapter._sketch_count}")
+        return str(adapter._last_sketch_name)
+
+    return cast(
+        AdapterResult[str],
+        adapter._handle_com_operation(
+            "create_3d_sketch", lambda: _with_selection_cleanup(adapter, _create)
+        ),
+    )
+
+
+def _add_3d_line_impl(
+    adapter: Any, x1: float, y1: float, z1: float, x2: float, y2: float, z2: float
+) -> AdapterResult[str]:
+    """Create one 3D line in millimetres and register its opaque sketch entity ID."""
+    if not adapter.currentSketchManager:
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="No active sketch")
+
+    def _create() -> str:
+        line = adapter.currentSketchManager.CreateLine(
+            x1 / 1000.0,
+            y1 / 1000.0,
+            z1 / 1000.0,
+            x2 / 1000.0,
+            y2 / 1000.0,
+            z2 / 1000.0,
+        )
+        if not line:
+            raise RuntimeError("SolidWorks could not create the 3D line")
+        return cast(str, adapter._register_sketch_entity("3DLine", line))
+
+    return cast(
+        AdapterResult[str], adapter._handle_com_operation("add_3d_line", _create)
+    )
+
+
+def _convert_sketch_entities_impl(
+    adapter: Any, edge_persistent_references: list[str]
+) -> AdapterResult[str]:
+    """Convert only server-owned part edges with ``SketchUseEdge3``."""
+    if not adapter.currentModel or not adapter.currentSketchManager:
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="No active sketch")
+
+    def _decode(token: str) -> bytes:
+        import base64
+
+        try:
+            value = base64.b64decode(token.encode("ascii"), validate=True)
+        except (UnicodeEncodeError, ValueError) as exc:
+            raise RuntimeError("Part edge reference is invalid") from exc
+        if not value:
+            raise RuntimeError("Part edge reference is invalid")
+        return value
+
+    def _resolve(extension: Any, token: str) -> Any:
+        resolver = getattr(extension, "GetObjectByPersistReference3", None)
+        if not callable(resolver):
+            raise RuntimeError("Active model does not support persistent references")
+        resolved = resolver(_decode(token))
+        entity = resolved[0] if isinstance(resolved, (tuple, list)) else resolved
+        if entity is None:
+            raise RuntimeError("Part edge can no longer be resolved")
+        return entity
+
+    def _select(entity: Any, append: bool) -> bool:
+        selector = getattr(adapter, "select_entity", None)
+        if callable(selector):
+            return bool(selector(entity, append))
+        for name, arguments in (("Select4", (append, None)), ("Select2", (append, 0))):
+            method = getattr(entity, name, None)
+            if callable(method) and method(*arguments):
+                return True
+        return False
+
+    def _convert() -> str:
+        extension = adapter.currentModel.Extension
+        adapter.currentModel.ClearSelection2(True)
+        try:
+            for index, token in enumerate(edge_persistent_references):
+                if not _select(_resolve(extension, token), index > 0):
+                    raise RuntimeError("SolidWorks could not select a part edge")
+            converter = getattr(adapter.currentSketchManager, "SketchUseEdge3", None)
+            if not callable(converter):
+                converter = getattr(adapter.currentSketchManager, "SketchUseEdge2", None)
+            if not callable(converter):
+                raise RuntimeError("Active sketch does not support Convert Entities")
+            try:
+                accepted = converter(False, False)
+            except TypeError:
+                accepted = converter(False, False, False)
+            if accepted is False:
+                raise RuntimeError("SolidWorks rejected Convert Entities")
+            return cast(
+                str,
+                adapter._register_sketch_entity(
+                    "ConvertedEntities", tuple(edge_persistent_references)
+                ),
+            )
+        finally:
+            adapter.currentModel.ClearSelection2(True)
+
+    return cast(
+        AdapterResult[str],
+        adapter._handle_com_operation("convert_sketch_entities", _convert),
     )

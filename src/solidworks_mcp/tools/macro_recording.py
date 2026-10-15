@@ -348,95 +348,24 @@ End Sub"""
 
     @mcp.tool()
     async def execute_macro(input_data: MacroPlaybackInput) -> dict[str, Any]:
-        """Handle execute macro.
-
-        This tool runs a previously recorded or written macro with optional parameters and
-        repeat functionality.
+        """Reject legacy path-based macro execution in favor of the typed safe flow.
 
         Args:
-            input_data (MacroPlaybackInput): The input data value.
+            input_data: Retained solely so old callers receive an actionable response.
 
         Returns:
-            dict[str, Any]: A dictionary containing the resulting values.
-
-        Example:
-                            >>> result = await execute_macro(playback_input)
+            A structured compatibility error directing callers to the trusted macro tools.
         """
-
-        try:
-            if hasattr(adapter, "execute_macro"):
-                result = await adapter.execute_macro(input_data.model_dump())
-                if result.is_success:
-                    return {
-                        "status": "success",
-                        "message": f"Macro executed {input_data.repeat_count} times successfully",
-                        "data": result.data,
-                        "execution_time": result.execution_time,
-                    }
-                return {
-                    "status": "error",
-                    "message": result.error or "Failed to execute macro",
-                }
-
-            execution_results: list[dict[str, Any]] = []
-
-            for run in range(input_data.repeat_count):
-                run_result = {
-                    "run_number": run + 1,
-                    "status": "success",
-                    "execution_time": 2.1 + (run * 0.1),  # Simulated timing
-                    "features_created": 3,
-                    "errors": 0,
-                    "warnings": 0,
-                }
-
-                execution_results.append(run_result)
-
-                # Simulate pause between runs
-                if (
-                    input_data.pause_between_runs > 0
-                    and run < input_data.repeat_count - 1
-                ):
-                    time.sleep(
-                        min(input_data.pause_between_runs, 1.0)
-                    )  # Cap the actual sleep
-
-            total_time = sum(float(r["execution_time"]) for r in execution_results)
-            total_features = sum(int(r["features_created"]) for r in execution_results)
-
-            return {
-                "status": "success",
-                "message": f"Macro executed {input_data.repeat_count} times successfully",
-                "data": {
-                    "macro_path": input_data.macro_path,
-                    "parameters_used": input_data.parameters,
-                    "repeat_count": input_data.repeat_count,
-                    "pause_between_runs": input_data.pause_between_runs,
-                    "total_execution_time": total_time,
-                    "total_features_created": total_features,
-                },
-                "macro_execution": {
-                    "macro_path": input_data.macro_path,
-                    "parameters_used": input_data.parameters,
-                    "repeat_count": input_data.repeat_count,
-                    "pause_between_runs": input_data.pause_between_runs,
-                    "total_execution_time": total_time,
-                    "total_features_created": total_features,
-                },
-                "run_details": execution_results,
-                "performance_metrics": {
-                    "average_run_time": total_time / input_data.repeat_count,
-                    "features_per_second": total_features / total_time,
-                    "success_rate": "100%",
-                },
-            }
-
-        except Exception as e:
-            logger.error(f"Error in execute_macro tool: {e}")
-            return {
-                "status": "error",
-                "message": f"Failed to execute macro: {str(e)}",
-            }
+        _ = input_data
+        return {
+            "status": "error",
+            "code": "LEGACY_MACRO_EXECUTION_DISABLED",
+            "message": (
+                "Direct path-based macro execution is disabled. Use "
+                "solidworks_list_trusted_macros, solidworks_prepare_trusted_macro, "
+                "and solidworks_execute_trusted_macro instead."
+            ),
+        }
 
     @mcp.tool()
     async def analyze_macro(input_data: MacroAnalysisInput) -> dict[str, Any]:

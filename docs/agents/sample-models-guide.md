@@ -135,9 +135,10 @@ For an LLM, a 2-sketch loft is the practical path:
 7. exit_sketch
 ```
 
-!!! note "Loft not yet available"
-    `create_loft` is not yet implemented. Use VBA to perform a proper loft:
-    call `generate_vba_part_modeling` with `operations` describing the loft, then `execute_macro`.
+!!! note "Typed loft references"
+    `solidworks_create_loft` accepts only profile sketch references issued by
+    the same workflow session after each sketch has been exited. It does not
+    accept arbitrary `SelectByID2` strings or guessed sketch names.
 
 ---
 
@@ -186,7 +187,12 @@ This is a complex injection-molded shell with:
 
 ### Recommended MCP approach
 
-Use `generate_vba_part_modeling` to script the full feature tree, then `execute_macro` to run it. The granular step-by-step approach (individual MCP tool calls) is impractical for 20+ features.
+Use `generate_vba_part_modeling` only to draft a full feature tree for review.
+It does not create an executable `.swp`: an administrator must provision the
+reviewed project as a trusted macro, then the MCP client uses
+`solidworks_prepare_trusted_macro` and `solidworks_execute_trusted_macro`.
+The granular step-by-step approach (individual MCP tool calls) is impractical
+for 20+ features.
 
 ```python
 # Request VBA for multi-feature shell
@@ -199,7 +205,7 @@ result = generate_vba_part_modeling(operations=[
     {"type": "shell", "thickness": 2, "open_faces": ["top"]},
     {"type": "boss_sketch", "plane": "Top", "features": "pcb_standoffs"},
 ])
-execute_macro(macro_path="generated_mouse_bottom.swp")
+# After administrative review/provisioning, use the trusted macro confirmation flow.
 ```
 
 ---

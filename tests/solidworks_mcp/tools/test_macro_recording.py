@@ -129,8 +129,10 @@ class TestMacroRecordingTools:
         mock_adapter.stop_macro_recording.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_execute_macro_success(self, mcp_server, mock_adapter, mock_config):
-        """Test successful macro execution."""
+    async def test_execute_macro_is_disabled_in_favor_of_typed_trusted_flow(
+        self, mcp_server, mock_adapter, mock_config
+    ):
+        """Legacy execution must not send an arbitrary caller path to the adapter."""
         await register_macro_recording_tools(mcp_server, mock_adapter, mock_config)
 
         mock_adapter.execute_macro = AsyncMock(
@@ -171,11 +173,10 @@ class TestMacroRecordingTools:
         assert tool_func is not None
         result = await tool_func(input_data=input_data)
 
-        assert result["status"] == "success"
-        assert result["data"]["execution_status"] == "Completed"
-        assert result["data"]["operations_performed"] == 25
-        assert result["data"]["errors_encountered"] == 0
-        mock_adapter.execute_macro.assert_called_once()
+        assert result["status"] == "error"
+        assert result["code"] == "LEGACY_MACRO_EXECUTION_DISABLED"
+        assert "solidworks_prepare_trusted_macro" in result["message"]
+        mock_adapter.execute_macro.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_analyze_macro_success(self, mcp_server, mock_adapter, mock_config):
@@ -523,7 +524,7 @@ class TestMacroRecordingTools:
     async def test_macro_tools_fallback_without_adapter_methods(
         self, mcp_server, mock_config
     ):
-        """Test simulated fallback branches when adapter methods are unavailable."""
+        """Keep non-execution fallbacks while blocking the unsafe execution fallback."""
         adapter_without_methods = object()
         await register_macro_recording_tools(
             mcp_server, adapter_without_methods, mock_config
@@ -560,8 +561,7 @@ class TestMacroRecordingTools:
                 pause_between_runs=0,
             )
         )
-        assert execute_result["status"] == "success"
-        assert execute_result["data"]["repeat_count"] == 2
+        assert execute_result["code"] == "LEGACY_MACRO_EXECUTION_DISABLED"
 
         batch_result = await batch_tool(
             input_data=MacroBatchInput(
@@ -576,7 +576,7 @@ class TestMacroRecordingTools:
     async def test_execute_macro_exception_path(
         self, mcp_server, mock_adapter, mock_config
     ):
-        """Test execute_macro exception handling branch."""
+        """Legacy execution stays disabled even when an adapter would fail."""
         await register_macro_recording_tools(mcp_server, mock_adapter, mock_config)
 
         mock_adapter.execute_macro = AsyncMock(side_effect=RuntimeError("engine down"))
@@ -592,14 +592,14 @@ class TestMacroRecordingTools:
             input_data=MacroPlaybackInput(macro_file="boom.swp", repeat_count=1)
         )
 
-        assert result["status"] == "error"
-        assert "Failed to execute macro" in result["message"]
+        assert result["code"] == "LEGACY_MACRO_EXECUTION_DISABLED"
+        mock_adapter.execute_macro.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_execute_macro_adapter_error_path(
         self, mcp_server, mock_adapter, mock_config
     ):
-        """Test execute_macro adapter error return path."""
+        """Legacy execution stays disabled even when an adapter returns an error."""
         await register_macro_recording_tools(mcp_server, mock_adapter, mock_config)
 
         mock_adapter.execute_macro = AsyncMock(
@@ -616,14 +616,14 @@ class TestMacroRecordingTools:
         result = await execute_tool(
             input_data=MacroPlaybackInput(macro_file="bad.swp", repeat_count=1)
         )
-        assert result["status"] == "error"
-        assert "macro syntax error" in result["message"]
+        assert result["code"] == "LEGACY_MACRO_EXECUTION_DISABLED"
+        mock_adapter.execute_macro.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_execute_macro_fallback_pause_between_runs_invokes_sleep(
+    async def test_execute_macro_does_not_run_legacy_repeat_or_sleep(
         self, mcp_server, mock_config, monkeypatch
     ):
-        """Fallback execute path should sleep between runs when pause is configured."""
+        """The disabled legacy path must not simulate or repeat macro execution."""
         await register_macro_recording_tools(mcp_server, object(), mock_config)
 
         execute_tool = None
@@ -648,8 +648,8 @@ class TestMacroRecordingTools:
             )
         )
 
-        assert result["status"] == "success"
-        assert len(sleep_calls) == 2
+        assert result["code"] == "LEGACY_MACRO_EXECUTION_DISABLED"
+        assert sleep_calls == []
 
     @pytest.mark.asyncio
     async def test_analyze_macro_fallback_path(self, mcp_server, mock_config):

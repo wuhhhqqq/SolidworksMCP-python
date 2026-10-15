@@ -10,6 +10,7 @@ Design note:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Any
 
 from ...adapters import create_adapter
 from ...agents.history_db import (
+    get_design_session,
     insert_tool_call_record,
     list_plan_checkpoints,
     update_plan_checkpoint,
@@ -39,6 +41,20 @@ from ._utils import (
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+_EMPTY_PART_LOCKS: dict[str, asyncio.Lock] = {}
+_CHECKPOINT_EXECUTION_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _empty_part_lock(session_id: str) -> asyncio.Lock:
+    """Return the process-local lock used to make blank-part bootstrap idempotent."""
+    return _EMPTY_PART_LOCKS.setdefault(session_id, asyncio.Lock())
+
+
+def _checkpoint_execution_lock(session_id: str) -> asyncio.Lock:
+    """Return the process-local lock for one session's checkpoint runner."""
+    return _CHECKPOINT_EXECUTION_LOCKS.setdefault(session_id, asyncio.Lock())
+
+
 def _planned_tools(planned: dict[str, Any]) -> list[str]:
     """Return the list of tool names from a planned-action dict.
 
@@ -121,14 +137,67 @@ async def _open_empty_part_before_checkpoint(
     """Create a blank part document and refresh preview before checkpoint execution."""
     from .preview_service import refresh_preview  # noqa: PLC0415
 
-    config = load_config()
-    adapter = await create_adapter(config)
     part_name = f"{session_id}_new_part"
+    lock = _empty_part_lock(session_id)
+    await lock.acquire()
+    adapter: Any | None = None
     try:
+        # The caller may have loaded ``session_row`` before another request
+        # completed the bootstrap. Re-read the row after acquiring the lock so
+        # the second request observes the title persisted by the first one.
+        latest_session_row = get_design_session(session_id, db_path=db_path)
+        if latest_session_row is None:
+            latest_session_row = session_row
+        session_meta = parse_json_blob(latest_session_row.get("metadata_json"))
+        existing_title = str(session_meta.get("new_design_part_title") or "").strip()
+        config = load_config()
+        adapter = await create_adapter(config)
         await adapter.connect()
+
+        # A dashboard retry can reach this helper again before the next
+        # checkpoint observes the persisted flag. Re-activate the part created
+        # by the same session instead of creating another blank window.
+        if existing_title:
+            activate_model = getattr(adapter, "activate_model", None)
+            if callable(activate_model):
+                activate_result = await activate_model(existing_title)
+                if getattr(activate_result, "is_success", False):
+                    merge_metadata(
+                        session_id,
+                        db_path=db_path,
+                        workflow_mode="new_design",
+                        new_design_part_opened=True,
+                        active_model_status="Reused the existing empty part document for checkpoint execution.",
+                        active_model_type="Part",
+                        active_model_configuration="Default",
+                        latest_message="Reused the existing empty part document for checkpoint execution.",
+                        latest_error_text="",
+                        remediation_hint="",
+                    )
+                    return {
+                        "part_name": part_name,
+                        "part_title": existing_title,
+                        "status": "reused",
+                        "reused_existing_document": True,
+                    }
+                raise RuntimeError(
+                    "The existing empty part could not be activated. Retry after "
+                    "SolidWorks finishes loading; no replacement part was created."
+                )
+            raise RuntimeError(
+                "The adapter cannot activate the existing empty part. No replacement "
+                "part was created."
+            )
+
         create_result = await adapter.create_part(name=part_name)
         if not getattr(create_result, "is_success", False):
             raise RuntimeError(create_result.error or "Failed to open blank part")
+
+        created_model = getattr(create_result, "data", None)
+        if isinstance(created_model, dict):
+            part_title = str(created_model.get("name") or "").strip()
+        else:
+            part_title = str(getattr(created_model, "name", "") or "").strip()
 
         merge_metadata(
             session_id,
@@ -136,6 +205,7 @@ async def _open_empty_part_before_checkpoint(
             workflow_mode="new_design",
             new_design_part_opened=True,
             new_design_part_name=part_name,
+            new_design_part_title=part_title,
             active_model_status="Opened a new empty part document for checkpoint execution.",
             active_model_type="Part",
             active_model_configuration="Default",
@@ -151,12 +221,18 @@ async def _open_empty_part_before_checkpoint(
                 {
                     "session_id": session_id,
                     "part_name": part_name,
-                    "user_goal": session_row.get("user_goal") or DEFAULT_USER_GOAL,
+                    "user_goal": latest_session_row.get("user_goal")
+                    or DEFAULT_USER_GOAL,
                 },
                 ensure_ascii=True,
             ),
             output_json=json.dumps(
-                {"part_name": part_name, "status": "success"},
+                {
+                    "part_name": part_name,
+                    "part_title": part_title,
+                    "status": "success",
+                    "created_new_document": True,
+                },
                 ensure_ascii=True,
             ),
             success=True,
@@ -185,11 +261,19 @@ async def _open_empty_part_before_checkpoint(
             )
     finally:
         try:
-            await adapter.disconnect()
+            if adapter is not None:
+                await adapter.disconnect()
         except Exception:
             pass
+        finally:
+            lock.release()
 
-    return {"part_name": part_name, "status": "success"}
+    return {
+        "part_name": part_name,
+        "part_title": part_title,
+        "status": "success",
+        "created_new_document": True,
+    }
 
 
 def _render_checkpoint_script(
@@ -978,6 +1062,16 @@ async def _run_checkpoint_tools(
 # Public API
 # ---------------------------------------------------------------------------
 async def execute_next_checkpoint(
+    session_id: str = DEFAULT_SESSION_ID,
+    *,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Serialize checkpoint selection, execution, and persistence per session."""
+    async with _checkpoint_execution_lock(session_id):
+        return await _execute_next_checkpoint_locked(session_id, db_path=db_path)
+
+
+async def _execute_next_checkpoint_locked(
     session_id: str = DEFAULT_SESSION_ID,
     *,
     db_path: Path | None = None,

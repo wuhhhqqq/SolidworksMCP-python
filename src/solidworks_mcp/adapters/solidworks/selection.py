@@ -95,3 +95,60 @@ class SolidWorksSelectionMixin:
         return self._handle_com_operation(
             "select_feature", self._feature_selector.select_feature, feature_name
         )
+
+    async def get_selection_state(self) -> AdapterResult[dict[str, Any]]:
+        """Read the current selection without exposing COM objects to callers."""
+        if not self.currentModel:
+            return AdapterResult(status=AdapterResultStatus.ERROR, error="No active model")
+
+        def _read() -> dict[str, Any]:
+            manager = self.currentModel.SelectionManager
+            count = int(
+                self._attempt(
+                    lambda: manager.GetSelectedObjectCount2(-1), default=0
+                )
+                or 0
+            )
+            entries: list[dict[str, Any]] = []
+            for index in range(1, min(count, 100) + 1):
+                object_type = int(
+                    self._attempt(
+                        lambda i=index: manager.GetSelectedObjectType3(i, -1),
+                        default=0,
+                    )
+                    or 0
+                )
+                mark = int(
+                    self._attempt(
+                        lambda i=index: manager.GetSelectedObjectMark(i), default=0
+                    )
+                    or 0
+                )
+                selected = self._attempt(
+                    lambda i=index: manager.GetSelectedObject6(i, -1), default=None
+                )
+                component = self._attempt(
+                    lambda i=index: manager.GetSelectedObjectsComponent3(i, -1), default=None
+                )
+                name = self._attempt(
+                    lambda: str(getattr(selected, "Name", "") or ""), default=""
+                )
+                component_name = self._attempt(
+                    lambda: str(getattr(component, "Name2", "") or ""), default=""
+                )
+                entries.append(
+                    {
+                        "index": index,
+                        "object_type": object_type,
+                        "mark": mark,
+                        "name": name or None,
+                        "component_name": component_name or None,
+                    }
+                )
+            return {
+                "count": count,
+                "truncated": count > len(entries),
+                "items": entries,
+            }
+
+        return self._handle_com_operation("get_selection_state", _read)

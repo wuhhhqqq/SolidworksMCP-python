@@ -265,8 +265,7 @@ class TestAnalysisTools:
         if hasattr(mock_adapter, "check_interference"):
             delattr(mock_adapter, "check_interference")
         fallback = await check_tool(input_data=InterferenceCheckInput())
-        assert fallback["status"] == "success"
-        assert fallback["interference_found"] is False
+        assert fallback["status"] == "unsupported"
 
         # Exception branch for adapter check_interference.
         mock_adapter.check_interference = AsyncMock(side_effect=RuntimeError("boom"))
@@ -285,9 +284,8 @@ class TestAnalysisTools:
             parameters = None
 
         bad_geo = await geometry_tool(input_data=_BadGeometryInput())
-        assert bad_geo["status"] == "error"
-        assert "bad analysis type" in bad_geo["message"]
+        assert bad_geo["status"] == "unsupported"
+        assert "no real SolidWorks" in bad_geo["message"]
 
         material = await material_tool()
-        assert material["status"] == "success"
-        assert material["material"]["name"]
+        assert material["status"] == "unsupported"

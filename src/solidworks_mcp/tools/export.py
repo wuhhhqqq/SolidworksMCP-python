@@ -4,13 +4,16 @@ Provides tools for exporting SolidWorks models to various formats including STEP
 STL, PDF, DWG, and image formats.
 """
 
-from typing import Any, TypeVar
+from __future__ import annotations
+
+from typing import Any, Literal, TypeVar
 
 from fastmcp import FastMCP
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from ..adapters.base import SolidWorksAdapter
+from ..adapters.base import AdapterResult, AdapterResultStatus, SolidWorksAdapter
+from ..adapters.dxf_caxa import inspect_caxa_2015_compatibility
 from .input_compat import CompatInput
 
 TInput = TypeVar("TInput", bound=BaseModel)
@@ -29,6 +32,50 @@ def _normalize_input(input_data: Any, model_type: type[TInput]) -> TInput:
     if isinstance(input_data, model_type):
         return input_data
     return model_type.model_validate(input_data)
+
+
+def _normalize_drawing_cad_input(
+    input_data: Any, expected_format: Literal["dwg", "dxf"]
+) -> ExportDrawingCadInput:
+    """Accept current and legacy export payloads for drawing CAD export."""
+    if isinstance(input_data, ExportDrawingCadInput):
+        return input_data
+    if isinstance(input_data, BaseModel):
+        payload = input_data.model_dump()
+    else:
+        payload = dict(input_data)
+    payload["format_type"] = payload.get("format_type") or expected_format
+    return ExportDrawingCadInput.model_validate(payload)
+
+
+async def _export_drawing_cad(
+    adapter: SolidWorksAdapter, input_data: ExportDrawingCadInput
+) -> Any:
+    """Use an exporter that explicitly guarantees the requested drawing space."""
+    exporter = getattr(adapter, "export_drawing_cad", None)
+    if callable(exporter):
+        if input_data.compatibility_profile == "caxa_2015":
+            result = await exporter(
+                input_data.file_path,
+                input_data.format_type,
+                input_data.model_space,
+                input_data.compatibility_profile,
+            )
+        else:
+            # Keep the established three-argument adapter contract for standard
+            # exports, including third-party adapters written before profiles.
+            result = await exporter(
+                input_data.file_path, input_data.format_type, input_data.model_space
+            )
+        if result.is_success or "not implemented" not in (result.error or "").lower():
+            return result
+    return AdapterResult(
+        status=AdapterResultStatus.ERROR,
+        error=(
+            "This SolidWorks adapter cannot guarantee the requested "
+            "DWG/DXF model-space or paper-space export."
+        ),
+    )
 
 
 # Input schemas using Python 3.14 built-in types
@@ -307,6 +354,40 @@ class ExportDWGInput(CompatInput):
             self.file_path = self.output_path
         if self.autocad_version is not None:
             self.version = self.autocad_version
+
+
+class ExportDrawingCadInput(CompatInput):
+    """Input for model-space or paper-space drawing CAD exports."""
+
+    file_path: str = Field(description="Full path for the exported DWG or DXF file")
+    format_type: Literal["dwg", "dxf"] = Field(
+        description="Target AutoCAD interchange format"
+    )
+    model_space: bool = Field(
+        default=True,
+        description="Export drawing entities to model space; disable for paper space",
+    )
+    compatibility_profile: Literal["standard", "caxa_2015"] = Field(
+        default="standard",
+        description=(
+            "standard preserves normal SolidWorks export behavior; caxa_2015 writes "
+            "a flattened R12 DXF consisting of CAXA CRX-safe base entities"
+        ),
+    )
+
+
+class ExportCaxa2015DxfInput(CompatInput):
+    """Input for a CAXA 2015 CRX-compatible DXF derivative."""
+
+    file_path: str = Field(
+        description="New .dxf output path; existing files are never overwritten"
+    )
+
+
+class InspectCaxa2015DxfInput(CompatInput):
+    """Input for inspecting an existing DXF before CAXA 2015 automation."""
+
+    file_path: str = Field(description="Existing DXF file path to inspect")
 
 
 class BatchExportInput(CompatInput):
@@ -704,7 +785,7 @@ async def register_export_tools(
             }
 
     @mcp.tool()
-    async def export_dwg(input_data: ExportFileInput) -> dict[str, Any]:
+    async def export_dwg(input_data: ExportDrawingCadInput) -> dict[str, Any]:
         """Export the current drawing to DWG format.
 
         Converts SolidWorks drawings to DWG (Drawing) format, the native AutoCAD file format
@@ -712,7 +793,7 @@ async def register_export_tools(
         drawings.
 
         Args:
-            input_data (ExportFileInput): The input data value.
+            input_data (ExportDrawingCadInput): The input data value.
 
         Returns:
             dict[str, Any]: A dictionary containing the resulting values.
@@ -744,25 +825,19 @@ async def register_export_tools(
                             - Preserves dimensions, annotations, and drawing structure
         """
         try:
-            if hasattr(adapter, "export_dwg"):
-                result = await adapter.export_dwg(input_data.model_dump())
-            else:
-                result = await adapter.export_file(input_data.file_path, "dwg")
+            input_data = _normalize_drawing_cad_input(input_data, "dwg")
+            if input_data.format_type != "dwg":
+                return {"status": "error", "message": "format_type must be 'dwg'"}
+            result = await _export_drawing_cad(adapter, input_data)
 
             if result.is_success:
-                if hasattr(adapter, "export_dwg"):
-                    return {
-                        "status": "success",
-                        "message": f"Exported to DWG format: {input_data.file_path}",
-                        "data": result.data,
-                        "execution_time": result.execution_time,
-                    }
                 return {
                     "status": "success",
                     "message": f"Exported to DWG format: {input_data.file_path}",
                     "export": {
                         "file_path": input_data.file_path,
                         "format": "DWG",
+                        "space": "model" if input_data.model_space else "paper",
                         "use_case": "AutoCAD compatibility",
                         "size_estimate": "Unknown",
                     },
@@ -780,6 +855,125 @@ async def register_export_tools(
                 "status": "error",
                 "message": f"Unexpected error: {str(e)}",
             }
+
+    @mcp.tool()
+    async def export_dxf(input_data: ExportDrawingCadInput) -> dict[str, Any]:
+        """Export the active SolidWorks drawing to DXF.
+
+        By default, the output is placed in AutoCAD model space for CAXA and
+        other 2D CAD systems. Set ``model_space`` to false only when paper-space
+        layouts are required.
+        """
+        try:
+            input_data = _normalize_drawing_cad_input(input_data, "dxf")
+            if input_data.format_type != "dxf":
+                return {"status": "error", "message": "format_type must be 'dxf'"}
+            if input_data.compatibility_profile == "caxa_2015" and not input_data.model_space:
+                return {
+                    "status": "error",
+                    "message": "CAXA 2015 export requires model_space=true",
+                }
+            result = await _export_drawing_cad(adapter, input_data)
+            if not result.is_success:
+                return {
+                    "status": "error",
+                    "message": f"Failed to export DXF: {result.error}",
+                }
+            return {
+                "status": "success",
+                "message": f"Exported to DXF format: {input_data.file_path}",
+                "export": {
+                    "file_path": input_data.file_path,
+                    "format": "DXF",
+                    "space": "model" if input_data.model_space else "paper",
+                    "compatibility_profile": input_data.compatibility_profile,
+                },
+                "data": result.data,
+                "execution_time": result.execution_time,
+            }
+        except Exception as e:
+            logger.error(f"Error in export_dxf tool: {e}")
+            return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+
+    @mcp.tool()
+    async def export_caxa_2015_dxf(
+        input_data: ExportCaxa2015DxfInput,
+    ) -> dict[str, Any]:
+        """Export a CAXA 2015-compatible model-space R12 DXF.
+
+        This is intended for CAXA 2015 CRX automation, not for preserving
+        drawing annotations. It expands nested blocks, converts LWPOLYLINE to
+        classic POLYLINE, and removes unsupported dimensions, hatches, splines
+        and proxy entities. The returned ``data.dropped_entities`` records
+        every removed entity type.
+        """
+        try:
+            normalized = _normalize_input(input_data, ExportCaxa2015DxfInput)
+            if not normalized.file_path.lower().endswith(".dxf"):
+                return {
+                    "status": "error",
+                    "message": "CAXA 2015 output path must use the .dxf extension",
+                }
+            result = await _export_drawing_cad(
+                adapter,
+                ExportDrawingCadInput(
+                    file_path=normalized.file_path,
+                    format_type="dxf",
+                    model_space=True,
+                    compatibility_profile="caxa_2015",
+                ),
+            )
+            if not result.is_success:
+                return {
+                    "status": "error",
+                    "message": f"Failed to export CAXA 2015 DXF: {result.error}",
+                }
+            return {
+                "status": "success",
+                "message": f"Exported CAXA 2015-compatible DXF: {normalized.file_path}",
+                "export": {
+                    "file_path": normalized.file_path,
+                    "format": "DXF R12",
+                    "space": "model",
+                    "compatibility_profile": "caxa_2015",
+                },
+                "data": result.data,
+                "execution_time": result.execution_time,
+            }
+        except Exception as e:
+            logger.error(f"Error in export_caxa_2015_dxf tool: {e}")
+            return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+
+    @mcp.tool()
+    async def inspect_caxa_2015_dxf(
+        input_data: InspectCaxa2015DxfInput,
+    ) -> dict[str, Any]:
+        """Check whether an existing DXF is safe for CAXA 2015 CRX enumeration.
+
+        The result identifies blocks, dimensions, splines, hatches and other
+        entity classes which CAXA might display while still hiding them from a
+        CRX program. Use ``export_caxa_2015_dxf`` to create a safe derivative.
+        """
+        try:
+            normalized = _normalize_input(input_data, InspectCaxa2015DxfInput)
+            if not normalized.file_path.lower().endswith(".dxf"):
+                return {
+                    "status": "error",
+                    "message": "CAXA 2015 inspection requires a .dxf file",
+                }
+            report = inspect_caxa_2015_compatibility(normalized.file_path)
+            return {
+                "status": "success",
+                "message": (
+                    "DXF is compatible with CAXA 2015 CRX basic-entity reading"
+                    if report["compatible"]
+                    else "DXF contains entities that CAXA 2015 CRX may not enumerate"
+                ),
+                "data": report,
+            }
+        except Exception as e:
+            logger.error(f"Error in inspect_caxa_2015_dxf tool: {e}")
+            return {"status": "error", "message": f"Unexpected error: {str(e)}"}
 
     @mcp.tool()
     async def export_image(input_data: ExportImageInput) -> dict[str, Any]:
@@ -947,5 +1141,5 @@ async def register_export_tools(
                 "message": f"Unexpected error: {str(e)}",
             }
 
-    tool_count = 7  # Number of tools registered
+    tool_count = 10  # Number of tools registered
     return tool_count

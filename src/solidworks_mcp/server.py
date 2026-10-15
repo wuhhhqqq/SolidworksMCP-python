@@ -21,7 +21,11 @@ from fastmcp import FastMCP
 from loguru import logger
 from pydantic import BaseModel
 from pydantic_ai import Agent
-from pydantic_ai.toolsets.fastmcp import FastMCPToolset
+
+try:
+    from pydantic_ai.toolsets.fastmcp import FastMCPToolset
+except ImportError:  # PydanticAI 2.x removed the in-process FastMCP toolset.
+    FastMCPToolset = None
 
 from . import adapters, security, tools, utils
 from .adapters.base import AdapterResult
@@ -327,6 +331,16 @@ class SolidWorksMCPServer:
         self.state.tool_count = len(await self.mcp.list_tools())
         self.server = self.mcp
 
+        # When the UI backend is hosted in the same process, let its Task Pane
+        # bridge reuse this exact registry/adapter instead of opening another
+        # SolidWorks COM session.  The import is optional and deliberately lazy.
+        try:
+            from .ui.panel_runtime import attach_panel_server
+
+            attach_panel_server(self)
+        except Exception as exc:  # pragma: no cover - UI is an optional surface
+            logger.debug("Panel runtime attachment skipped: {}", exc)
+
         # Setup PydanticAI agent after tools are registered so the agent can bind
         # directly to the in-process FastMCP server without a transport hop.
         await self._setup_agent()
@@ -468,11 +482,32 @@ class SolidWorksMCPServer:
         logger.info("Stopping SolidWorks MCP Server...")
 
         if self.adapter:
-            await self.adapter.disconnect()
-            self.state.is_connected = False
+            try:
+                if self.config.close_session_documents_on_shutdown:
+                    cleanup_result = await self.adapter.close_all_session_docs()
+                    if getattr(cleanup_result, "is_error", False):
+                        logger.warning(
+                            "Some SolidWorks session documents could not be closed: {}",
+                            getattr(cleanup_result, "error", "unknown error"),
+                        )
+                else:
+                    logger.info(
+                        "Leaving SolidWorks documents open while the MCP server stops"
+                    )
+            except Exception as exc:
+                logger.warning("Failed to close SolidWorks session documents: {}", exc)
+            finally:
+                await self.adapter.disconnect()
+                self.state.is_connected = False
 
         self._setup_complete = False
         self.server = None
+        try:
+            from .ui.panel_runtime import detach_panel_server
+
+            detach_panel_server(self)
+        except Exception as exc:  # pragma: no cover - UI is an optional surface
+            logger.debug("Panel runtime detachment skipped: {}", exc)
         logger.info("Server stopped")
 
     async def health_check(self) -> dict[str, Any]:

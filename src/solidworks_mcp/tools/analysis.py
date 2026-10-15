@@ -15,6 +15,14 @@ from pydantic import BaseModel, Field
 from ..adapters.base import SolidWorksAdapter
 from .input_compat import CompatInput
 
+
+def _unsupported_legacy_tool(name: str) -> dict[str, Any]:
+    """Do not report fabricated engineering-analysis data as real."""
+    return {
+        "status": "unsupported",
+        "message": f"{name} has no real SolidWorks analysis adapter binding.",
+    }
+
 # Input schemas using Python 3.14 built-in types
 
 
@@ -297,14 +305,7 @@ async def register_analysis_tools(
                 }
 
             # Simulated interference check - would use actual analysis
-            return {
-                "status": "success",
-                "message": "Interference check completed",
-                "interference_found": False,  # Would be actual result
-                "components_checked": input_data.components,
-                "tolerance": input_data.tolerance,
-                "interferences": [],  # Would contain actual interference data
-            }
+            return _unsupported_legacy_tool('check_interference')
 
         except Exception as e:
             logger.error(f"Error in check_interference tool: {e}")
@@ -327,17 +328,7 @@ async def register_analysis_tools(
             dict[str, Any]: A dictionary containing the resulting values.
         """
         try:
-            # Simulated geometry analysis
-            return {
-                "status": "success",
-                "message": f"Geometry analysis ({input_data.analysis_type}) completed",
-                "analysis_type": input_data.analysis_type,
-                "results": {
-                    "summary": f"Analysis of type {input_data.analysis_type} completed",
-                    "parameters": input_data.parameters,
-                    "findings": ["No issues found"],  # Would be actual results
-                },
-            }
+            return _unsupported_legacy_tool("analyze_geometry")
 
         except Exception as e:
             logger.error(f"Error in analyze_geometry tool: {e}")
@@ -356,20 +347,7 @@ async def register_analysis_tools(
         Returns:
             dict[str, Any]: A dictionary containing the resulting values.
         """
-        # Simulated material properties
-        return {
-            "status": "success",
-            "material": {
-                "name": "Steel, Plain Carbon",
-                "density": {"value": 7850, "units": "kg/m³"},
-                "elastic_modulus": {"value": 200000, "units": "MPa"},
-                "yield_strength": {"value": 250, "units": "MPa"},
-                "ultimate_tensile_strength": {"value": 400, "units": "MPa"},
-                "poissons_ratio": 0.29,
-                "thermal_conductivity": {"value": 50, "units": "W/(m·K)"},
-                "specific_heat": {"value": 460, "units": "J/(kg·K)"},
-            },
-        }
+        return _unsupported_legacy_tool("get_material_properties")
 
     # Future analysis tools:
     # - perform_fea_analysis (if FEA capabilities are available)

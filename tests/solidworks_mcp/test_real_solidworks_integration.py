@@ -12,14 +12,45 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from solidworks_mcp.adapters.base import ReferencePlaneParameters
 from solidworks_mcp.config import (
     AdapterType,
     DeploymentMode,
     SecurityLevel,
     SolidWorksMCPConfig,
 )
+from solidworks_mcp.contracts.mvp import (
+    ActivateConfigurationRequest,
+    AddRectangleRequest,
+    CreateAssemblyRequest,
+    CreateDrawingRequest,
+    CreateDrawingViewRequest,
+    CreateExtrusionRequest,
+    CreateFeatureCircularPatternRequest,
+    CreateFeatureLinearPatternRequest,
+    CreatePartRequest,
+    CreateProjectedDrawingViewRequest,
+    CreateReferencePlaneRequest,
+    CreateSketchRequest,
+    DocumentRequest,
+    ExitSketchRequest,
+    ExportFileRequest,
+    GetReferenceAxisRequest,
+    GetReferencePlaneRequest,
+    InsertAssemblyComponentRequest,
+    ListAssemblyComponentsRequest,
+    ListConfigurationsRequest,
+    ListCustomPropertiesRequest,
+    ListDrawingViewsRequest,
+    ListFeaturesRequest,
+    MirrorFeatureRequest,
+    SaveModelRequest,
+    SessionRequest,
+    SetCustomPropertyRequest,
+)
 from solidworks_mcp.server import SolidWorksMCPServer
 from solidworks_mcp.tools.file_management import SaveAsInput, SaveFileInput
+from solidworks_mcp.tools.import_cad import ImportDxfToPartInput
 from solidworks_mcp.tools.modeling import (
     CloseModelInput,
     CreateAssemblyInput,
@@ -50,7 +81,9 @@ async def _tool_names(server: SolidWorksMCPServer) -> list[str]:
 
 
 @pytest_asyncio.fixture
-async def real_server() -> AsyncGenerator[SolidWorksMCPServer, None]:
+async def real_server(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> AsyncGenerator[SolidWorksMCPServer, None]:
     """Test helper for real server."""
     if platform.system() != "Windows":
         pytest.skip("Real SolidWorks integration tests require Windows")
@@ -68,6 +101,7 @@ async def real_server() -> AsyncGenerator[SolidWorksMCPServer, None]:
         testing=False,
         debug=True,
         enable_windows_validation=False,
+        data_dir=tmp_path_factory.mktemp("solidworks_mcp_real_data"),
     )
 
     server = SolidWorksMCPServer(config)
@@ -108,6 +142,53 @@ def integration_output_dir() -> Path:
     output_dir = Path("tests") / ".generated" / "solidworks_integration"
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+@pytest.mark.windows_only
+@pytest.mark.solidworks_only
+async def test_real_dxf_import_preflight_and_boss_extrude(
+    real_server: SolidWorksMCPServer,
+) -> None:
+    """Import a clean DXF profile, validate it natively, and create a part.
+
+    The DXF and resulting part are placed in pytest's per-run data directory.
+    The real-server fixture closes the created document without closing the
+    manually started SolidWorks application.
+    """
+    import ezdxf
+
+    import_tool = await _find_tool(real_server, "import_dxf_to_part")
+    work_dir = real_server.config.data_dir / "dxf_import_smoke"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    source_path = work_dir / "closed_rectangle_mm.dxf"
+    output_path = work_dir / "closed_rectangle_mm.sldprt"
+
+    document = ezdxf.new("R2010")
+    document.header["$INSUNITS"] = 4  # Millimetres
+    modelspace = document.modelspace()
+    corners = ((0.0, 0.0), (60.0, 0.0), (60.0, 40.0), (0.0, 40.0))
+    for start, end in zip(corners, (*corners[1:], corners[0]), strict=True):
+        modelspace.add_line(start, end)
+    document.saveas(source_path)
+
+    result = await import_tool(
+        ImportDxfToPartInput(
+            source_path=str(source_path),
+            output_path=str(output_path),
+            plane="Front",
+            extrusion_depth_mm=12.0,
+            verify_with_solidworks=True,
+        )
+    )
+
+    assert result["status"] == "success", result
+    assert result["imported_entities"] == {"LINE": 4}
+    assert result["validation"]["is_ready_for_extrusion"] is True
+    assert result["solidworks_validation"]["is_valid"] is True
+    assert result["part"]["extrusion_depth_mm"] == 12.0
+    assert output_path.is_file(), result
 
 
 @pytest.mark.asyncio
@@ -184,6 +265,320 @@ async def test_real_solidworks_connection_health(
     health = await real_server.health_check()
     assert health["status"] in {"healthy", "warning"}
     assert health["adapter"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+@pytest.mark.windows_only
+@pytest.mark.solidworks_only
+async def test_real_reference_plane_adapter(
+    real_server: SolidWorksMCPServer,
+) -> None:
+    """Create an offset plane through the adapter with a localized template."""
+    tools = {
+        tool.name: tool.fn
+        for tool in await real_server.mcp.list_tools()
+        if tool.name.startswith("solidworks_")
+    }
+    session = await tools["solidworks_create_session"]()
+    session_id = session.data["session"]["session_id"]
+    part = await tools["solidworks_create_part"](
+        CreatePartRequest(session_id=session_id, name="MCP_ReferencePlane_Probe")
+    )
+    assert part.status.value == "succeeded", part
+
+    adapter = real_server.adapter
+    while hasattr(adapter, "adapter"):
+        adapter = adapter.adapter
+    result = await adapter.create_reference_plane(
+        ReferencePlaneParameters(base_plane="Front", offset=10.0)
+    )
+
+    assert result.is_success, result.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+@pytest.mark.windows_only
+@pytest.mark.solidworks_only
+async def test_real_typed_mvp_part_to_step_workflow(
+    real_server: SolidWorksMCPServer,
+) -> None:
+    """Build and export a part through the typed, session-scoped MCP surface."""
+    tools = {
+        tool.name: tool.fn
+        for tool in await real_server.mcp.list_tools()
+        if tool.name.startswith("solidworks_")
+    }
+
+    session = await tools["solidworks_create_session"]()
+    assert session.status.value == "succeeded", session
+    assert session.data["session"]["connected"] is True
+    session_id = session.data["session"]["session_id"]
+
+    part = await tools["solidworks_create_part"](
+        CreatePartRequest(session_id=session_id, name="MCP_Typed_MVP_Bracket")
+    )
+    assert part.status.value == "succeeded", part
+    document_id = part.data["document"]["document_id"]
+
+    reference_plane = await tools["solidworks_create_reference_plane"](
+        CreateReferencePlaneRequest(
+            session_id=session_id,
+            document_id=document_id,
+            base_plane="Front",
+            offset=10,
+        )
+    )
+    assert reference_plane.status.value == "succeeded", reference_plane
+
+    sketch = await tools["solidworks_create_sketch"](
+        CreateSketchRequest(
+            session_id=session_id,
+            document_id=document_id,
+            reference_plane_id=reference_plane.data["reference_plane"]["persistent_id"],
+        )
+    )
+    assert sketch.status.value == "succeeded", sketch
+    sketch_id = sketch.data["sketch"]["persistent_id"]
+
+    rectangle = await tools["solidworks_add_rectangle"](
+        AddRectangleRequest(
+            session_id=session_id,
+            document_id=document_id,
+            sketch_id=sketch_id,
+            x1=0,
+            y1=0,
+            x2=30,
+            y2=20,
+        )
+    )
+    assert rectangle.status.value == "succeeded", rectangle
+
+    exited = await tools["solidworks_exit_sketch"](
+        ExitSketchRequest(
+            session_id=session_id,
+            document_id=document_id,
+            sketch_id=sketch_id,
+        )
+    )
+    assert exited.status.value == "succeeded", exited
+
+    extrusion = await tools["solidworks_create_extrusion"](
+        CreateExtrusionRequest(
+            session_id=session_id,
+            document_id=document_id,
+            sketch_id=sketch_id,
+            depth=10,
+        )
+    )
+    assert extrusion.status.value == "succeeded", extrusion
+
+    linear_pattern = await tools["solidworks_create_feature_linear_pattern"](
+        CreateFeatureLinearPatternRequest(
+            session_id=session_id,
+            document_id=document_id,
+            feature_id=extrusion.data["feature"]["persistent_id"],
+            direction="X",
+            instances=2,
+            spacing=40,
+        )
+    )
+    assert linear_pattern.status.value == "succeeded", linear_pattern
+
+    origin_axis = await tools["solidworks_get_reference_axis"](
+        GetReferenceAxisRequest(
+            session_id=session_id, document_id=document_id, axis="Z"
+        )
+    )
+    assert origin_axis.status.value == "succeeded", origin_axis
+    circular_pattern = await tools["solidworks_create_feature_circular_pattern"](
+        CreateFeatureCircularPatternRequest(
+            session_id=session_id,
+            document_id=document_id,
+            feature_id=linear_pattern.data["feature"]["persistent_id"],
+            reference_axis_id=origin_axis.data["reference_axis"]["persistent_id"],
+            instances=2,
+            angle_degrees=180,
+        )
+    )
+    assert circular_pattern.status.value == "succeeded", circular_pattern
+
+    origin_plane = await tools["solidworks_get_reference_plane"](
+        GetReferencePlaneRequest(
+            session_id=session_id, document_id=document_id, plane="Right"
+        )
+    )
+    assert origin_plane.status.value == "succeeded", origin_plane
+    mirrored_feature = await tools["solidworks_mirror_feature"](
+        MirrorFeatureRequest(
+            session_id=session_id,
+            document_id=document_id,
+            feature_id=circular_pattern.data["feature"]["persistent_id"],
+            reference_plane_id=origin_plane.data["reference_plane"]["persistent_id"],
+        )
+    )
+    assert mirrored_feature.status.value == "succeeded", mirrored_feature
+
+    features = await tools["solidworks_list_features"](
+        ListFeaturesRequest(session_id=session_id, document_id=document_id)
+    )
+    assert features.status.value == "succeeded", features
+    assert features.data["total"] >= 1
+
+    configurations = await tools["solidworks_list_configurations"](
+        ListConfigurationsRequest(session_id=session_id, document_id=document_id)
+    )
+    assert configurations.status.value == "succeeded", configurations
+    assert configurations.data["total"] >= 1
+    configuration_name = configurations.data["configurations"][0]["name"]
+    activated_configuration = await tools["solidworks_activate_configuration"](
+        ActivateConfigurationRequest(
+            session_id=session_id,
+            document_id=document_id,
+            configuration_name=configuration_name,
+        )
+    )
+    assert activated_configuration.status.value == "succeeded", activated_configuration
+    assert (
+        activated_configuration.data["document"]["configuration"] == configuration_name
+    )
+
+    set_property = await tools["solidworks_set_custom_property"](
+        SetCustomPropertyRequest(
+            session_id=session_id,
+            document_id=document_id,
+            name="McpIntegrationId",
+            value="typed-mvp-bracket",
+        )
+    )
+    assert set_property.status.value == "succeeded", set_property
+    properties = await tools["solidworks_list_custom_properties"](
+        ListCustomPropertiesRequest(
+            session_id=session_id,
+            document_id=document_id,
+        )
+    )
+    assert properties.status.value == "succeeded", properties
+    assert any(
+        property_["name"] == "McpIntegrationId"
+        and property_["value"] == "typed-mvp-bracket"
+        for property_ in properties.data["properties"]
+    )
+
+    model_info = await tools["solidworks_get_model_info"](
+        DocumentRequest(session_id=session_id, document_id=document_id)
+    )
+    assert model_info.status.value == "succeeded", model_info
+
+    mass_properties = await tools["solidworks_get_mass_properties"](
+        DocumentRequest(session_id=session_id, document_id=document_id)
+    )
+    assert mass_properties.status.value == "succeeded", mass_properties
+
+    exported = await tools["solidworks_export_file"](
+        ExportFileRequest(
+            session_id=session_id,
+            document_id=document_id,
+            artifact_name="mcp_typed_mvp_bracket",
+            format_type="step",
+        )
+    )
+    assert exported.status.value == "succeeded", exported
+    artifact_path = Path(exported.data["artifact"]["path"])
+    assert artifact_path.suffix.lower() == ".step"
+    assert artifact_path.is_file()
+
+    native_save = await tools["solidworks_save_model"](
+        SaveModelRequest(
+            session_id=session_id,
+            document_id=document_id,
+            artifact_name="mcp_typed_mvp_bracket_native",
+        )
+    )
+    assert native_save.status.value == "succeeded", native_save
+    native_path = Path(native_save.data["artifact"]["path"])
+    assert native_path.suffix.lower() == ".sldprt"
+    assert native_path.is_file()
+
+    assembly = await tools["solidworks_create_assembly"](
+        CreateAssemblyRequest(session_id=session_id, name="MCP_Typed_MVP_Assembly")
+    )
+    assert assembly.status.value == "succeeded", assembly
+    assert assembly.data["document"]["document_type"] == "assembly"
+    assembly_document_id = assembly.data["document"]["document_id"]
+
+    inserted_component = await tools["solidworks_insert_assembly_component"](
+        InsertAssemblyComponentRequest(
+            session_id=session_id,
+            document_id=assembly_document_id,
+            source_part_document_id=document_id,
+            x=20,
+        )
+    )
+    assert inserted_component.status.value == "succeeded", inserted_component
+    assert inserted_component.data["component"]["document_type"] == "part"
+    assert inserted_component.data["document"]["revision"] == 2
+
+    components = await tools["solidworks_list_assembly_components"](
+        ListAssemblyComponentsRequest(
+            session_id=session_id,
+            document_id=assembly_document_id,
+        )
+    )
+    assert components.status.value == "succeeded", components
+    assert components.data["total"] >= 1
+
+    drawing = await tools["solidworks_create_drawing"](
+        CreateDrawingRequest(session_id=session_id, name="MCP_Typed_MVP_Drawing")
+    )
+    assert drawing.status.value == "succeeded", drawing
+    assert drawing.data["document"]["document_type"] == "drawing"
+    drawing_document_id = drawing.data["document"]["document_id"]
+
+    drawing_view = await tools["solidworks_create_drawing_view"](
+        CreateDrawingViewRequest(
+            session_id=session_id,
+            document_id=drawing_document_id,
+            source_model_document_id=document_id,
+            orientation="isometric",
+            x=100,
+            y=100,
+        )
+    )
+    assert drawing_view.status.value == "succeeded", drawing_view
+    assert drawing_view.data["view"]["view_id"]
+    assert drawing_view.data["document"]["revision"] == 2
+
+    projected_drawing_view = await tools["solidworks_create_projected_drawing_view"](
+        CreateProjectedDrawingViewRequest(
+            session_id=session_id,
+            document_id=drawing_document_id,
+            source_view_id=drawing_view.data["view"]["view_id"],
+            x=150,
+            y=100,
+        )
+    )
+    if projected_drawing_view.status.value == "succeeded":
+        assert projected_drawing_view.data["view"]["view_id"]
+    else:
+        assert projected_drawing_view.status.value == "failed", projected_drawing_view
+        assert projected_drawing_view.error is not None
+        assert projected_drawing_view.error.code == "SW_PROJECTED_VIEW_UNSUPPORTED"
+
+    drawing_views = await tools["solidworks_list_drawing_views"](
+        ListDrawingViewsRequest(
+            session_id=session_id,
+            document_id=drawing_document_id,
+        )
+    )
+    assert drawing_views.status.value == "succeeded", drawing_views
+    assert drawing_views.data["total"] >= 1
+
+    closed = await tools["solidworks_close_session"](
+        SessionRequest(session_id=session_id)
+    )
+    assert closed.status.value == "succeeded", closed
 
 
 @pytest.mark.asyncio

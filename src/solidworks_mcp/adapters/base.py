@@ -12,11 +12,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel
 
 T = TypeVar("T")
+
+
+# Stable adapter error codes consumed by workflow-level MCP responses. These
+# describe known SolidWorks API capability limits rather than transient COM errors.
+ADAPTER_ERROR_PROJECTED_DRAWING_VIEW_UNSUPPORTED = "SW_PROJECTED_VIEW_UNSUPPORTED"
+ADAPTER_ERROR_CHAMFER_EDGE_SELECTION = "SW_CHAMFER_EDGE_SELECTION_FAILED"
+ADAPTER_ERROR_CHAMFER_SELECTION_COUNT = "SW_CHAMFER_SELECTION_COUNT_MISMATCH"
+ADAPTER_ERROR_CHAMFER_CREATION = "SW_CHAMFER_CREATION_FAILED"
 
 
 class AdapterHealth(BaseModel):
@@ -209,6 +217,7 @@ class ExtrusionParameters(BaseModel):
         end_condition (str): The end condition value.
         feature_scope (bool): The feature scope value.
         merge_result (bool): The merge result value.
+        is_cut (bool): Whether the revolve removes material instead of adding it.
         reverse_direction (bool): The reverse direction value.
         thin_feature (bool): The thin feature value.
         thin_thickness (float | None): The thin thickness value.
@@ -248,6 +257,80 @@ class RevolveParameters(BaseModel):
     thin_feature: bool = False
     thin_thickness: float | None = None
     merge_result: bool = True
+    is_cut: bool = False
+
+
+class ReferencePlaneParameters(BaseModel):
+    """Parameters for an offset reference plane based on a standard plane."""
+
+    base_plane: str
+    offset: float
+    reverse_direction: bool = False
+
+
+class OriginPlaneParameters(BaseModel):
+    """Parameters identifying one standard origin plane in the active part."""
+
+    plane: str
+
+
+class ReferenceAxisParameters(BaseModel):
+    """Parameters identifying one standard origin axis in the active part."""
+
+    axis: str
+
+
+class FeatureLinearPatternParameters(BaseModel):
+    """Parameters for a one-direction linear pattern of one feature."""
+
+    feature_name: str
+    direction: str
+    instances: int
+    spacing: float
+    reverse_direction: bool = False
+
+
+class FeatureCircularPatternParameters(BaseModel):
+    """Parameters for a circular pattern of one feature about a named axis."""
+
+    feature_name: str
+    axis_name: str
+    instances: int
+    angle_degrees: float
+    reverse_direction: bool = False
+
+
+class FeatureMirrorParameters(BaseModel):
+    """Parameters for mirroring one feature about a named reference plane."""
+
+    feature_name: str
+    plane_name: str
+
+
+class HoleWizardParameters(BaseModel):
+    """Controlled parameters for an ANSI Metric M6 clearance Hole Wizard."""
+
+    location_sketch_name: str
+    diameter: float
+    depth: float
+
+
+class ThreadedHoleParameters(BaseModel):
+    """Parameters for a standard ANSI Metric tapped Hole Wizard feature."""
+
+    location_sketch_name: str
+    thread_size: Literal[
+        "M3x0.5",
+        "M4x0.7",
+        "M5x0.8",
+        "M6x1.0",
+        "M8x1.25",
+        "M10x1.5",
+        "M12x1.75",
+        "M16x2.0",
+    ]
+    depth: float
+    through_all: bool = False
 
 
 class SweepParameters(BaseModel):
@@ -256,14 +339,18 @@ class SweepParameters(BaseModel):
     Attributes:
         merge_result (bool): The merge result value.
         path (str): The path value.
+        profile (str | None): Optional explicitly selected profile sketch name.
         twist_along_path (bool): The twist along path value.
         twist_angle (float): The twist angle value.
+        is_cut (bool): Remove material instead of adding it.
     """
 
     path: str
+    profile: str | None = None
     twist_along_path: bool = False
     twist_angle: float = 0.0
     merge_result: bool = True
+    is_cut: bool = False
 
 
 class LoftParameters(BaseModel):
@@ -275,6 +362,7 @@ class LoftParameters(BaseModel):
         merge_result (bool): The merge result value.
         profiles (list[str]): The profiles value.
         start_tangent (str | None): The start tangent value.
+        is_cut (bool): Remove material instead of adding it.
     """
 
     profiles: list[str]
@@ -282,6 +370,7 @@ class LoftParameters(BaseModel):
     start_tangent: str | None = None
     end_tangent: str | None = None
     merge_result: bool = True
+    is_cut: bool = False
 
 
 class MassProperties(BaseModel):
@@ -396,6 +485,21 @@ class SolidWorksAdapter(ABC):
         """
         pass
 
+    async def activate_model(
+        self, name: str, path: str | None = None
+    ) -> AdapterResult[None]:
+        """Activate one already-open model by its trusted title or path.
+
+        Stateful workflow tools call this before operating on a tracked document.
+        Adapters that cannot select a previously opened document must return an
+        error rather than applying an operation to an arbitrary active document.
+        """
+        _ = name, path
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="activate_model is not implemented by this adapter",
+        )
+
     @abstractmethod
     async def close_model(self, save: bool = False) -> AdapterResult[None]:
         """Close the current model.
@@ -407,6 +511,18 @@ class SolidWorksAdapter(ABC):
             AdapterResult[None]: The result produced by the operation.
         """
         pass
+
+    async def close_all_session_docs(self) -> AdapterResult[None]:
+        """Close documents owned by this adapter session, if it tracks them.
+
+        Implementations must never terminate the SolidWorks application as part
+        of this cleanup. Adapters that do not track document ownership return a
+        warning so server shutdown remains safe across all adapter types.
+        """
+        return AdapterResult(
+            status=AdapterResultStatus.WARNING,
+            error="This adapter does not track session-owned documents",
+        )
 
     async def save_file(self, file_path: str | None = None) -> AdapterResult[Any]:
         """Save the active model to the existing path or the provided path.
@@ -454,6 +570,126 @@ class SolidWorksAdapter(ABC):
         """
         pass
 
+    async def list_solid_bodies(
+        self, include_hidden: bool = False
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """List solid bodies in the active part document.
+
+        Args:
+            include_hidden: Include bodies not visible in the current configuration.
+
+        Returns:
+            Serializable body summaries, or an explicit unsupported error.
+        """
+        _ = include_hidden
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="list_solid_bodies is not implemented by this adapter",
+        )
+
+    async def list_part_topology(
+        self, entity_types: tuple[str, ...] = ("face", "edge")
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """List internal persistent references for faces and edges in an active part."""
+        _ = entity_types
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="list_part_topology is not implemented by this adapter",
+        )
+
+    async def list_sheet_metal_feature_geometry(
+        self,
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """List persistent face references associated with sheet-metal bends."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="list_sheet_metal_feature_geometry is not implemented by this adapter",
+        )
+
+    async def insert_sheet_metal_bend_notes(self) -> AdapterResult[dict[str, Any]]:
+        """Insert bend notes using the active part's own flat-pattern feature."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="insert_sheet_metal_bend_notes is not implemented by this adapter",
+        )
+
+    async def insert_sheet_metal_bend_table(
+        self, x_m: float, y_m: float, start_value: int
+    ) -> AdapterResult[dict[str, Any]]:
+        """Insert a default-template bend table at a controlled model position."""
+        _ = x_m, y_m, start_value
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="insert_sheet_metal_bend_table is not implemented by this adapter",
+        )
+
+    async def list_surface_bodies(
+        self, include_hidden: bool = False
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """List surface bodies in the active part document."""
+        _ = include_hidden
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="list_surface_bodies is not implemented by this adapter",
+        )
+
+    async def get_material_assignment(
+        self, configuration_name: str
+    ) -> AdapterResult[dict[str, str]]:
+        """Read material metadata for one active part configuration."""
+        _ = configuration_name
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="get_material_assignment is not implemented by this adapter",
+        )
+
+    async def set_material_assignment(
+        self, configuration_name: str, database_name: str, material_name: str
+    ) -> AdapterResult[dict[str, str]]:
+        """Assign and verify a material for one active part configuration."""
+        _ = configuration_name, database_name, material_name
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="set_material_assignment is not implemented by this adapter",
+        )
+
+    async def create_configuration(
+        self, configuration_name: str, description: str = ""
+    ) -> AdapterResult[str]:
+        """Create and activate one independent configuration on the active model."""
+        _ = configuration_name, description
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_configuration is not implemented by this adapter",
+        )
+
+    async def delete_configuration(self, configuration_name: str) -> AdapterResult[str]:
+        """Delete one non-active model configuration after adapter-side verification."""
+        _ = configuration_name
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="delete_configuration is not implemented by this adapter",
+        )
+
+    async def activate_configuration(
+        self, configuration_name: str
+    ) -> AdapterResult[str]:
+        """Activate an existing configuration on the active model.
+
+        Adapters that cannot safely switch configurations return an explicit
+        unsupported result instead of relying on UI selection state.
+
+        Args:
+            configuration_name (str): Existing SolidWorks configuration name.
+
+        Returns:
+            AdapterResult[str]: Verified active configuration name on success.
+        """
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="activate_configuration is not implemented by this adapter",
+        )
+
     @abstractmethod
     async def create_part(
         self, name: str | None = None, units: str | None = None
@@ -497,6 +733,554 @@ class SolidWorksAdapter(ABC):
         """
         pass
 
+    async def insert_assembly_component(
+        self,
+        component_path: str,
+        x_m: float,
+        y_m: float,
+        z_m: float,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Insert one saved component into the active assembly in metres.
+
+        Implementations must reject calls when the active document is not an
+        assembly. The returned mapping contains only a stable component ID,
+        display name, and referenced document type.
+        """
+        _ = component_path, x_m, y_m, z_m
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="insert_assembly_component is not implemented by this adapter",
+        )
+
+    async def list_assembly_components(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List client-safe component summaries from the active assembly."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="list_assembly_components is not implemented by this adapter",
+        )
+
+    async def check_assembly_interference(
+        self,
+        include_coincident: bool,
+        include_multibody_part_interferences: bool,
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """Run native interference detection for every component in an assembly."""
+        _ = include_coincident, include_multibody_part_interferences
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="check_assembly_interference is not implemented by this adapter",
+        )
+
+    async def get_assembly_component(
+        self, component_name: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Look up one active-assembly component by its display name."""
+        _ = component_name
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="get_assembly_component is not implemented by this adapter",
+        )
+
+    async def list_assembly_mate_entities(
+        self,
+        component_id: str | None = None,
+        entity_types: tuple[str, ...] = ("face", "edge"),
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """List internal persistent references for geometry in the active assembly.
+
+        Returned rows are consumed by the workflow only. Implementations must
+        never expose COM objects and must include a persistent reference token.
+        """
+        _ = component_id, entity_types
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="list_assembly_mate_entities is not implemented by this adapter",
+        )
+
+    async def create_assembly_mate(
+        self,
+        first_persistent_reference: str,
+        second_persistent_reference: str,
+        *,
+        mate_type: str,
+        alignment: str,
+        flip: bool,
+        distance_m: float,
+        angle_radians: float,
+        for_positioning_only: bool,
+        lock_rotation: bool,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create one active-assembly mate from internal persistent references."""
+        _ = (
+            first_persistent_reference,
+            second_persistent_reference,
+            mate_type,
+            alignment,
+            flip,
+            distance_m,
+            angle_radians,
+            for_positioning_only,
+            lock_rotation,
+        )
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_assembly_mate is not implemented by this adapter",
+        )
+
+    async def list_assembly_mates(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List active-assembly mate references for safe enumeration and deletion."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="list_assembly_mates is not implemented by this adapter",
+        )
+
+    async def delete_assembly_mate(
+        self, persistent_reference: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Delete one active-assembly mate identified by an internal token."""
+        _ = persistent_reference
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="delete_assembly_mate is not implemented by this adapter",
+        )
+
+    async def create_drawing_view(
+        self,
+        model_path: str,
+        model_view_name: str,
+        x_m: float,
+        y_m: float,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create one standard model view in the active drawing in metres.
+
+        The workflow layer owns source-path authorization and passes only a
+        server-controlled native model path plus a fixed SolidWorks view name.
+        """
+        _ = model_path, model_view_name, x_m, y_m
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_drawing_view is not implemented by this adapter",
+        )
+
+    async def list_drawing_views(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List client-safe model-view summaries from the active drawing."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="list_drawing_views is not implemented by this adapter",
+        )
+
+    async def activate_drawing_view(
+        self, view_id: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Activate one current drawing view by its server-issued view ID."""
+        _ = view_id
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="activate_drawing_view is not implemented by this adapter",
+        )
+
+    async def list_drawing_sheets(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List current drawing sheets without changing the active sheet."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="list_drawing_sheets is not implemented by this adapter",
+        )
+
+    async def activate_drawing_sheet(
+        self, sheet_name: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Activate one current drawing sheet by exact name."""
+        _ = sheet_name
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="activate_drawing_sheet is not implemented by this adapter",
+        )
+
+    async def create_drawing_sheet(
+        self,
+        sheet_name: str,
+        paper_size: str,
+        width_m: float,
+        height_m: float,
+        first_angle_projection: bool,
+        scale_numerator: int,
+        scale_denominator: int,
+        zone_rows: int,
+        zone_columns: int,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create and activate one drawing sheet in the active drawing document."""
+        _ = (
+            sheet_name,
+            paper_size,
+            width_m,
+            height_m,
+            first_angle_projection,
+            scale_numerator,
+            scale_denominator,
+            zone_rows,
+            zone_columns,
+        )
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_drawing_sheet is not implemented by this adapter",
+        )
+
+    async def delete_drawing_sheet(
+        self, sheet_name: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Delete one current drawing sheet, never the final sheet."""
+        _ = sheet_name
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="delete_drawing_sheet is not implemented by this adapter",
+        )
+
+    async def rename_drawing_sheet(
+        self, sheet_name: str, new_sheet_name: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Rename one current drawing sheet through a typed sheet API."""
+        _ = sheet_name, new_sheet_name
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="rename_drawing_sheet is not implemented by this adapter",
+        )
+
+    async def reorder_drawing_sheets(
+        self, sheet_names: list[str]
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """Replace the full current drawing-sheet order."""
+        _ = sheet_names
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="reorder_drawing_sheets is not implemented by this adapter")
+
+    async def get_drawing_view_outline(
+        self, view_id: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Read one active-drawing view's axis-aligned layout outline in metres."""
+        _ = view_id
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="get_drawing_view_outline is not implemented by this adapter",
+        )
+
+    async def update_drawing_view_layout(
+        self,
+        view_id: str,
+        x_m: float | None,
+        y_m: float | None,
+        scale_decimal: float | None,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Move and/or rescale one current drawing view by its server-issued ID."""
+        _ = view_id, x_m, y_m, scale_decimal
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="update_drawing_view_layout is not implemented by this adapter",
+        )
+
+    async def align_drawing_views(
+        self,
+        view_ids: list[str],
+        direction: str,
+        gap_m: float,
+        start_x_m: float | None,
+        start_y_m: float | None,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Arrange several current drawing views from their outline dimensions."""
+        _ = view_ids, direction, gap_m, start_x_m, start_y_m
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="align_drawing_views is not implemented by this adapter",
+        )
+
+    async def rebuild_drawing(self) -> AdapterResult[dict[str, Any]]:
+        """Rebuild and save the active drawing document."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="rebuild_drawing is not implemented by this adapter",
+        )
+
+    async def create_projected_drawing_view(
+        self, source_view_id: str, x_m: float, y_m: float
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create a projected view from a known active-drawing view in metres.
+
+        Implementations must resolve ``source_view_id`` only inside the active
+        drawing and return a safe view identifier/display-name summary.
+        """
+        _ = source_view_id, x_m, y_m
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_projected_drawing_view is not implemented by this adapter",
+        )
+
+    async def create_auxiliary_drawing_view(
+        self, persistent_reference: str, x_m: float, y_m: float
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create an auxiliary view from one server-issued drawing edge reference."""
+        _ = persistent_reference, x_m, y_m
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_auxiliary_drawing_view is not implemented by this adapter",
+        )
+
+    async def create_section_drawing_view(
+        self,
+        source_view_id: str,
+        cut_start_x_m: float,
+        cut_start_y_m: float,
+        cut_end_x_m: float,
+        cut_end_y_m: float,
+        x_m: float,
+        y_m: float,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create one section view from a known view and explicit sheet coordinates."""
+        _ = (
+            source_view_id,
+            cut_start_x_m,
+            cut_start_y_m,
+            cut_end_x_m,
+            cut_end_y_m,
+            x_m,
+            y_m,
+        )
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_section_drawing_view is not implemented by this adapter",
+        )
+
+    async def get_sheet_metal_info(self) -> AdapterResult[dict[str, Any]]:
+        """Return active-part sheet-metal state without exposing COM objects."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="get_sheet_metal_info is not implemented by this adapter",
+        )
+
+    async def set_sheet_metal_flat_state(
+        self, flattened: bool
+    ) -> AdapterResult[dict[str, Any]]:
+        """Flatten or refold the active sheet-metal part."""
+        _ = flattened
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="set_sheet_metal_flat_state is not implemented by this adapter",
+        )
+
+    async def export_flat_pattern_dxf(
+        self, file_path: str, model_path: str, sheet_metal_options: int
+    ) -> AdapterResult[dict[str, Any]]:
+        """Export one saved sheet-metal part through the dedicated DXF API."""
+        _ = file_path, model_path, sheet_metal_options
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="export_flat_pattern_dxf is not implemented by this adapter",
+        )
+
+    async def create_drawing_bom(
+        self,
+        source_view_id: str,
+        bom_type: str,
+        configuration_name: str,
+        x_m: float,
+        y_m: float,
+        detailed_cut_list: bool,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Insert one BOM table into the active drawing from a known model view."""
+        _ = (
+            source_view_id,
+            bom_type,
+            configuration_name,
+            x_m,
+            y_m,
+            detailed_cut_list,
+        )
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_drawing_bom is not implemented by this adapter",
+        )
+
+    async def update_drawing_bom(
+        self, persistent_reference: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Refresh a drawing BOM table from its internal persistent reference."""
+        _ = persistent_reference
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="update_drawing_bom is not implemented by this adapter",
+        )
+
+    async def delete_drawing_bom(
+        self, persistent_reference: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Delete a drawing BOM table from its internal persistent reference."""
+        _ = persistent_reference
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="delete_drawing_bom is not implemented by this adapter",
+        )
+
+    async def create_drawing_note(
+        self, text: str, x_m: float, y_m: float
+    ) -> AdapterResult[dict[str, Any]]:
+        """Insert one positioned text note into the active drawing."""
+        _ = text, x_m, y_m
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_drawing_note is not implemented by this adapter",
+        )
+
+    async def list_drawing_annotation_targets(
+        self, view_id: str, target_types: tuple[str, ...]
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """List internal persistent references eligible for drawing annotations."""
+        _ = view_id, target_types
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="list_drawing_annotation_targets is not implemented by this adapter",
+        )
+
+    async def place_drawing_dimension(
+        self, persistent_reference: str, x_m: float, y_m: float
+    ) -> AdapterResult[dict[str, Any]]:
+        """Place one selected display dimension on the active drawing sheet."""
+        _ = persistent_reference, x_m, y_m
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="place_drawing_dimension is not implemented by this adapter",
+        )
+
+    async def create_drawing_balloon(
+        self,
+        persistent_reference: str,
+        x_m: float,
+        y_m: float,
+        style: str,
+        text: str,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create one BOM balloon from an internal component reference."""
+        _ = persistent_reference, x_m, y_m, style, text
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_drawing_balloon is not implemented by this adapter",
+        )
+
+    async def create_drawing_hole_callout(
+        self, persistent_reference: str, x_m: float, y_m: float
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create one automatic hole callout from an internal edge reference."""
+        _ = persistent_reference, x_m, y_m
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_drawing_hole_callout is not implemented by this adapter",
+        )
+
+    async def create_drawing_ordinate_dimension(
+        self, persistent_reference: str, x_m: float, y_m: float, ordinate_type: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create an ordinate dimension from an internal drawing target."""
+        _ = persistent_reference, x_m, y_m, ordinate_type
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="create_drawing_ordinate_dimension is not implemented by this adapter")
+
+    async def create_drawing_surface_finish(
+        self, persistent_reference: str, x_m: float, y_m: float, symbol: str, value: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Insert a surface-finish symbol on an internal drawing target."""
+        _ = persistent_reference, x_m, y_m, symbol, value
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="create_drawing_surface_finish is not implemented by this adapter")
+
+    async def create_drawing_weld_symbol(
+        self, persistent_reference: str, x_m: float, y_m: float, weld_type: str, size: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Insert a weld symbol on an internal drawing target."""
+        _ = persistent_reference, x_m, y_m, weld_type, size
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="create_drawing_weld_symbol is not implemented by this adapter")
+
+    async def create_drawing_geometric_tolerance(
+        self, persistent_reference: str, x_m: float, y_m: float, tolerance: str, datum: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Insert a geometric tolerance frame on an internal drawing target."""
+        _ = persistent_reference, x_m, y_m, tolerance, datum
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="create_drawing_geometric_tolerance is not implemented by this adapter")
+
+    async def create_drawing_center_mark(
+        self, persistent_reference: str, size_m: float, show_connection_lines: bool
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create a center mark from an internal circular drawing-edge target."""
+        _ = persistent_reference, size_m, show_connection_lines
+        return AdapterResult(status=AdapterResultStatus.ERROR, error="create_drawing_center_mark is not implemented by this adapter")
+
+    async def create_drawing_revision_table(
+        self,
+        x_m: float,
+        y_m: float,
+        anchor_type: int,
+        revision: str,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create a revision table on the active drawing sheet."""
+        _ = x_m, y_m, anchor_type, revision
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_drawing_revision_table is not implemented by this adapter",
+        )
+
+    async def list_drawing_revisions(
+        self, persistent_reference: str
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """List rows from one revision table identified by a persistent reference."""
+        _ = persistent_reference
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="list_drawing_revisions is not implemented by this adapter",
+        )
+
+    async def add_drawing_revision(
+        self, persistent_reference: str, revision: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Add one revision row to a revision table."""
+        _ = persistent_reference, revision
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="add_drawing_revision is not implemented by this adapter",
+        )
+
+    async def delete_drawing_revision(
+        self, persistent_reference: str, revision_id: int, delete_symbols: bool
+    ) -> AdapterResult[dict[str, Any]]:
+        """Delete one revision row from a revision table."""
+        _ = persistent_reference, revision_id, delete_symbols
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="delete_drawing_revision is not implemented by this adapter",
+        )
+
+    async def list_custom_properties(
+        self, configuration_name: str | None = None
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """List custom properties for the document or one active configuration."""
+        _ = configuration_name
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="list_custom_properties is not implemented by this adapter",
+        )
+
+    async def set_custom_property(
+        self, name: str, value: str, configuration_name: str | None = None
+    ) -> AdapterResult[dict[str, Any]]:
+        """Set one document or active-configuration custom property."""
+        _ = name, value, configuration_name
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="set_custom_property is not implemented by this adapter",
+        )
+
+    async def delete_custom_property(
+        self, name: str, configuration_name: str | None = None
+    ) -> AdapterResult[dict[str, str]]:
+        """Delete one custom property from the document or active configuration."""
+        _ = name, configuration_name
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="delete_custom_property is not implemented by this adapter",
+        )
+
     # Feature Operations
     @abstractmethod
     async def create_extrusion(
@@ -525,6 +1309,86 @@ class SolidWorksAdapter(ABC):
             AdapterResult[SolidWorksFeature]: The result produced by the operation.
         """
         pass
+
+    async def create_reference_plane(
+        self, params: ReferencePlaneParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create an offset reference plane from a standard reference plane."""
+        _ = params
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_reference_plane is not implemented by this adapter",
+        )
+
+    async def get_reference_axis(
+        self, params: ReferenceAxisParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Resolve one standard origin axis without creating model geometry."""
+        _ = params
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="get_reference_axis is not implemented by this adapter",
+        )
+
+    async def get_reference_plane(
+        self, params: OriginPlaneParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Resolve one standard origin plane without creating model geometry."""
+        _ = params
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="get_reference_plane is not implemented by this adapter",
+        )
+
+    async def create_feature_linear_pattern(
+        self, params: FeatureLinearPatternParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a linear pattern from one trusted feature and a standard direction."""
+        _ = params
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_feature_linear_pattern is not implemented by this adapter",
+        )
+
+    async def create_feature_circular_pattern(
+        self, params: FeatureCircularPatternParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a circular pattern from one trusted feature and origin axis."""
+        _ = params
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_feature_circular_pattern is not implemented by this adapter",
+        )
+
+    async def mirror_feature(
+        self, params: FeatureMirrorParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Mirror one trusted feature about one trusted reference plane."""
+        _ = params
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="mirror_feature is not implemented by this adapter",
+        )
+
+    async def create_hole_wizard(
+        self, params: HoleWizardParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a controlled Hole Wizard feature from a trusted location sketch."""
+        _ = params
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_hole_wizard is not implemented by this adapter",
+        )
+
+    async def create_tapped_hole(
+        self, params: ThreadedHoleParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a standard tapped Hole Wizard feature."""
+        _ = params
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_tapped_hole is not implemented by this adapter",
+        )
 
     @abstractmethod
     async def create_sweep(
@@ -584,6 +1448,33 @@ class SolidWorksAdapter(ABC):
         """
         pass
 
+    async def create_3d_sketch(self) -> AdapterResult[str]:
+        """Open a new three-dimensional sketch in the active part document."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_3d_sketch is not implemented by this adapter",
+        )
+
+    async def add_3d_line(
+        self, x1: float, y1: float, z1: float, x2: float, y2: float, z2: float
+    ) -> AdapterResult[str]:
+        """Add one three-dimensional line segment in millimetres."""
+        _ = x1, y1, z1, x2, y2, z2
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="add_3d_line is not implemented by this adapter",
+        )
+
+    async def convert_sketch_entities(
+        self, edge_persistent_references: list[str]
+    ) -> AdapterResult[str]:
+        """Convert internal part-edge references into active-sketch geometry."""
+        _ = edge_persistent_references
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="convert_sketch_entities is not implemented by this adapter",
+        )
+
     @abstractmethod
     async def add_circle(
         self, center_x: float, center_y: float, radius: float
@@ -599,6 +1490,14 @@ class SolidWorksAdapter(ABC):
             AdapterResult[str]: The result produced by the operation.
         """
         pass
+
+    async def add_point(self, x: float, y: float) -> AdapterResult[str]:
+        """Add one point to the active sketch in millimetres."""
+        _ = x, y
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="add_point is not implemented by this adapter",
+        )
 
     @abstractmethod
     async def add_rectangle(
@@ -719,6 +1618,21 @@ class SolidWorksAdapter(ABC):
             error="add_ellipse is not implemented by this adapter",
         )
 
+    async def add_sketch_text(
+        self,
+        text: str,
+        x: float,
+        y: float,
+        height: float,
+        angle_degrees: float,
+    ) -> AdapterResult[str]:
+        """Add one text entity to the current sketch."""
+        _ = text, x, y, height, angle_degrees
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="add_sketch_text is not implemented by this adapter",
+        )
+
     async def add_sketch_constraint(
         self,
         entity1: str,
@@ -781,6 +1695,24 @@ class SolidWorksAdapter(ABC):
         return AdapterResult(
             status=AdapterResultStatus.ERROR,
             error="check_sketch_fully_defined is not implemented by this adapter",
+        )
+
+    async def check_sketch_feature_use(
+        self, sketch_name: str | None = None, feature_use: str = "boss_extrude"
+    ) -> AdapterResult[dict[str, Any]]:
+        """Ask the SolidWorks sketch kernel whether a sketch can create a feature.
+
+        Args:
+            sketch_name: Optional sketch feature name. Defaults to the last active sketch.
+            feature_use: Intended feature type, such as ``"boss_extrude"``.
+
+        Returns:
+            Feature-use validation payload, including native status and contour counts.
+        """
+        _ = sketch_name, feature_use
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="check_sketch_feature_use is not implemented by this adapter",
         )
 
     async def sketch_linear_pattern(
@@ -872,6 +1804,58 @@ class SolidWorksAdapter(ABC):
             error="sketch_offset is not implemented by this adapter",
         )
 
+    async def sketch_trim(
+        self, entity_id: str, trim_x: float, trim_y: float
+    ) -> AdapterResult[str]:
+        """Trim one registered sketch entity at a point expressed in millimetres.
+
+        The returned entity ID remains the server-issued source entity ID. The
+        underlying SolidWorks sketch segment is modified in place.
+        """
+        _ = entity_id, trim_x, trim_y
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="sketch_trim is not implemented by this adapter",
+        )
+
+    async def sketch_split(
+        self,
+        entity_id: str,
+        x: float,
+        y: float,
+        z: float = 0.0,
+        closed: bool = False,
+        x2: float | None = None,
+        y2: float | None = None,
+        z2: float | None = None,
+    ) -> AdapterResult[str]:
+        """Split one registered sketch segment at one or two points."""
+        _ = entity_id, x, y, z, closed, x2, y2, z2
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="sketch_split is not implemented by this adapter",
+        )
+
+    async def sketch_fillet(
+        self, entities: list[str], radius: float
+    ) -> AdapterResult[str]:
+        """Round the corner formed by two registered sketch entities."""
+        _ = entities, radius
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="sketch_fillet is not implemented by this adapter",
+        )
+
+    async def sketch_chamfer(
+        self, entities: list[str], distance: float, angle_degrees: float = 45.0
+    ) -> AdapterResult[str]:
+        """Bevel the corner formed by two registered sketch entities."""
+        _ = entities, distance, angle_degrees
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="sketch_chamfer is not implemented by this adapter",
+        )
+
     async def add_sketch_circle(
         self,
         center_x: float,
@@ -926,6 +1910,145 @@ class SolidWorksAdapter(ABC):
             error="create_cut_extrude is not implemented by this adapter",
         )
 
+    async def create_sheet_metal_base_flange(
+        self,
+        sketch_name: str,
+        thickness_mm: float,
+        bend_radius_mm: float,
+        k_factor: float,
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a sheet-metal base flange from a trusted exited sketch."""
+        _ = sketch_name, thickness_mm, bend_radius_mm, k_factor
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_sheet_metal_base_flange is not implemented by this adapter",
+        )
+
+    async def create_sheet_metal_edge_flange(
+        self,
+        edge_persistent_reference: str,
+        length_mm: float,
+        angle_degrees: float,
+        bend_radius_mm: float,
+        k_factor: float,
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a sheet-metal edge flange from an internal edge reference."""
+        _ = (
+            edge_persistent_reference,
+            length_mm,
+            angle_degrees,
+            bend_radius_mm,
+            k_factor,
+        )
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_sheet_metal_edge_flange is not implemented by this adapter",
+        )
+
+    async def set_sheet_metal_k_factor(
+        self, k_factor: float
+    ) -> AdapterResult[dict[str, Any]]:
+        """Set and read back the active part sheet-metal K factor."""
+        _ = k_factor
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="set_sheet_metal_k_factor is not implemented by this adapter",
+        )
+
+    async def create_shell(
+        self, face_persistent_references: list[str], thickness_mm: float, outward: bool
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a shell after selecting server-owned faces to remove."""
+        _ = face_persistent_references, thickness_mm, outward
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_shell is not implemented by this adapter",
+        )
+
+    async def create_rib(
+        self,
+        sketch_name: str,
+        thickness_mm: float,
+        draft_angle_degrees: float,
+        direction: str,
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create one rib from a trusted exited sketch."""
+        _ = sketch_name, thickness_mm, draft_angle_degrees, direction
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_rib is not implemented by this adapter",
+        )
+
+    async def create_dome(
+        self, face_persistent_reference: str, height_mm: float, reverse_direction: bool
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a dome on a face identified by an internal persistent reference."""
+        _ = face_persistent_reference, height_mm, reverse_direction
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_dome is not implemented by this adapter",
+        )
+
+    async def create_draft(
+        self,
+        face_persistent_references: list[str],
+        angle_degrees: float,
+        reverse_direction: bool,
+        edge_draft: bool,
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Apply a multi-face neutral-plane draft to persistent part faces."""
+        _ = face_persistent_references, angle_degrees, reverse_direction, edge_draft
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_draft is not implemented by this adapter",
+        )
+
+    async def create_thicken(
+        self,
+        face_persistent_reference: str,
+        thickness_mm: float,
+        operation: str,
+        direction: str,
+        fill_volume: bool,
+        merge_result: bool,
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Thicken one persistent surface face into a boss or cut feature."""
+        _ = (
+            face_persistent_reference,
+            thickness_mm,
+            operation,
+            direction,
+            fill_volume,
+            merge_result,
+        )
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_thicken is not implemented by this adapter",
+        )
+
+    async def create_wrap(
+        self,
+        sketch_name: str,
+        face_persistent_reference: str,
+        operation: str,
+        thickness_mm: float,
+        reverse_direction: bool,
+        method: str,
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Wrap a trusted sketch onto one persistent part face."""
+        _ = (
+            sketch_name,
+            face_persistent_reference,
+            operation,
+            thickness_mm,
+            reverse_direction,
+            method,
+        )
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_wrap is not implemented by this adapter",
+        )
+
     async def add_fillet(
         self, radius: float, edge_names: list[str]
     ) -> AdapterResult[Any]:
@@ -943,6 +2066,37 @@ class SolidWorksAdapter(ABC):
         return AdapterResult(
             status=AdapterResultStatus.ERROR,
             error="add_fillet is not implemented by this adapter",
+        )
+
+    async def add_chamfer(
+        self, distance: float, edge_names: list[str]
+    ) -> AdapterResult[Any]:
+        """Add an equal-distance chamfer to explicitly selected edges.
+
+        Args:
+            distance: Chamfer distance in millimetres.
+            edge_names: SolidWorks edge names or coordinate edge specifications.
+
+        Returns:
+            A created chamfer feature or an explicit adapter error.
+        """
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="add_chamfer is not implemented by this adapter",
+        )
+
+    async def create_chamfer(
+        self,
+        edge_persistent_references: list[str],
+        distance_mm: float,
+        angle_degrees: float,
+        chamfer_type: str,
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a chamfer from workflow-owned persistent edge references."""
+        _ = edge_persistent_references, distance_mm, angle_degrees, chamfer_type
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="create_chamfer is not implemented by this adapter",
         )
 
     @abstractmethod
@@ -963,6 +2117,36 @@ class SolidWorksAdapter(ABC):
             AdapterResult[MassProperties]: The result produced by the operation.
         """
         pass
+
+    async def get_bounding_box(self) -> AdapterResult[dict[str, list[float]]]:
+        """Read the active part's axis-aligned extents in millimetres."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="get_bounding_box is not implemented by this adapter",
+        )
+
+    async def list_equations(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List active-part equations and global variables without COM objects."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="list_equations is not implemented by this adapter",
+        )
+
+    async def set_equation(
+        self, name: str, expression: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create or update one equation or global variable by its name."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="set_equation is not implemented by this adapter",
+        )
+
+    async def delete_equation(self, name: str) -> AdapterResult[dict[str, Any]]:
+        """Delete one equation or global variable by its name."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="delete_equation is not implemented by this adapter",
+        )
 
     # Export Operations
     @abstractmethod
@@ -996,7 +2180,62 @@ class SolidWorksAdapter(ABC):
         """
         pass
 
+    async def get_configuration(
+        self, configuration_name: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Read one exact configuration and its descriptive metadata."""
+        _ = configuration_name
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="get_configuration is not implemented by this adapter",
+        )
+
+    async def list_open_models(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List native documents currently open in the SolidWorks instance."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="list_open_models is not implemented by this adapter",
+        )
+
+    async def get_selection_state(self) -> AdapterResult[dict[str, Any]]:
+        """Return a serializable snapshot of the active SolidWorks selection set."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="get_selection_state is not implemented by this adapter",
+        )
+
+    async def export_drawing_cad(
+        self,
+        file_path: str,
+        format_type: str,
+        model_space: bool = True,
+        compatibility_profile: str = "standard",
+    ) -> AdapterResult[None]:
+        """Export an active drawing as DWG or DXF with explicit space selection.
+
+        Args:
+            file_path: Destination DWG or DXF file path.
+            format_type: Either ``"dwg"`` or ``"dxf"``.
+            model_space: Write drawing entities to AutoCAD model space when true.
+            compatibility_profile: ``"standard"`` or ``"caxa_2015"``. The
+                CAXA profile creates a flattened R12 DXF for CAXA CRX readers.
+
+        Returns:
+            The export result.
+        """
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="export_drawing_cad is not implemented by this adapter",
+        )
+
     # Dimension Operations
+    async def list_dimensions(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List active-model dimensions with their private native names and values."""
+        return AdapterResult(
+            status=AdapterResultStatus.ERROR,
+            error="list_dimensions is not implemented by this adapter",
+        )
+
     @abstractmethod
     async def get_dimension(self, name: str) -> AdapterResult[float]:
         """Get the value of a dimension.

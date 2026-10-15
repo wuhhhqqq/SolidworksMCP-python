@@ -66,12 +66,15 @@ async def _validate_solidworks_installation(config: SolidWorksMCPConfig) -> None
                 f"SolidWorks executable not found at: {config.solidworks_path}"
             )
 
-    # Try to check COM registration (basic check)
+    # Attach-only probe: Dispatch would COM-start SolidWorks and can show
+    # different startup dialogs than an interactive desktop launch.
     try:
         import win32com.client
 
-        # Try to create SolidWorks object (without starting it)
-        win32com.client.Dispatch("SldWorks.Application", None)
-        logger.info("SolidWorks COM interface is available")
+        win32com.client.GetActiveObject("SldWorks.Application")
+        logger.info("A running SolidWorks COM interface is available")
     except Exception as e:
-        logger.warning(f"SolidWorks COM interface issue: {e}")
+        logger.warning(
+            "No running SolidWorks COM interface is available. Start SolidWorks "
+            f"from the desktop shortcut before connecting: {e}"
+        )

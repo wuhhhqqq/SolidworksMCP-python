@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -441,6 +442,158 @@ async def test_open_empty_part_before_checkpoint_handles_preview_error(
 
 
 @pytest.mark.asyncio
+async def test_open_empty_part_reuses_session_part_title_without_creating_again(
+    monkeypatch, tmp_path
+) -> None:
+    """A repeated checkpoint bootstrap activates the prior part instead of duplicating it."""
+    from solidworks_mcp.ui.services import preview_service
+
+    class ReuseAdapter(StubAdapter):
+        async def activate_model(self, name: str, path: str | None = None):
+            self.calls.append(("activate_model", name, path))
+            return _ok_result()
+
+    adapter = ReuseAdapter()
+    merge_calls: list[dict[str, object]] = []
+
+    async def _create_adapter(_cfg):
+        return adapter
+
+    async def _refresh_preview(*_a, **_kw):
+        return {}
+
+    monkeypatch.setattr(service, "create_adapter", _create_adapter)
+    monkeypatch.setattr(service, "load_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        service, "merge_metadata", lambda *_a, **kw: merge_calls.append(kw)
+    )
+    monkeypatch.setattr(service, "insert_tool_call_record", lambda **_kw: None)
+    monkeypatch.setattr(service, "ensure_preview_dir", lambda: tmp_path)
+    monkeypatch.setattr(preview_service, "refresh_preview", _refresh_preview)
+
+    result = await service._open_empty_part_before_checkpoint(
+        session_id="reuse-session",
+        session_row={
+            "user_goal": "demo",
+            "metadata_json": json.dumps({"new_design_part_title": "Part1"}),
+        },
+        db_path=None,
+        api_origin="http://localhost",
+    )
+
+    assert result["status"] == "reused"
+    assert result["reused_existing_document"] is True
+    assert ("activate_model", "Part1", None) in adapter.calls
+    assert not any(call[0] == "create_part" for call in adapter.calls)
+
+
+@pytest.mark.asyncio
+async def test_open_empty_part_does_not_replace_part_when_activation_fails(
+    monkeypatch, tmp_path
+) -> None:
+    """A temporary activation failure must not create another empty part."""
+    class FailingActivationAdapter(StubAdapter):
+        async def activate_model(self, name: str, path: str | None = None):
+            self.calls.append(("activate_model", name, path))
+            return SimpleNamespace(is_success=False, error="still loading")
+
+    adapter = FailingActivationAdapter()
+
+    async def _create_adapter(_cfg):
+        return adapter
+
+    monkeypatch.setattr(service, "create_adapter", _create_adapter)
+    monkeypatch.setattr(service, "load_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(service, "ensure_preview_dir", lambda: tmp_path)
+
+    with pytest.raises(RuntimeError, match="no replacement part was created"):
+        await service._open_empty_part_before_checkpoint(
+            session_id="activation-failure",
+            session_row={
+                "user_goal": "demo",
+                "metadata_json": json.dumps({"new_design_part_title": "Part1"}),
+            },
+            db_path=None,
+            api_origin="http://localhost",
+        )
+
+    assert ("activate_model", "Part1", None) in adapter.calls
+    assert not any(call[0] == "create_part" for call in adapter.calls)
+
+
+@pytest.mark.asyncio
+async def test_open_empty_part_serializes_concurrent_bootstrap_requests(
+    monkeypatch, tmp_path
+) -> None:
+    """Concurrent dashboard retries create one document and reuse it on the second call."""
+    from solidworks_mcp.ui.services import preview_service
+
+    state = {"metadata_json": json.dumps({})}
+    created_count = 0
+
+    class ConcurrentAdapter(StubAdapter):
+        async def create_part(self, name: str):
+            nonlocal created_count
+            created_count += 1
+            await asyncio.sleep(0)
+            self.calls.append(("create_part", name))
+            return SimpleNamespace(
+                is_success=True,
+                error="",
+                data=SimpleNamespace(name="Part1"),
+            )
+
+        async def activate_model(self, name: str, path: str | None = None):
+            self.calls.append(("activate_model", name, path))
+            return _ok_result()
+
+    adapters: list[ConcurrentAdapter] = []
+
+    async def _create_adapter(_cfg):
+        adapter = ConcurrentAdapter()
+        adapters.append(adapter)
+        return adapter
+
+    def _get_session(_session_id, db_path=None):
+        return {"user_goal": "demo", **state}
+
+    def _merge_metadata(_session_id, **kwargs):
+        state["metadata_json"] = json.dumps(
+            {"new_design_part_title": kwargs.get("new_design_part_title", "Part1")}
+        )
+
+    async def _refresh_preview(*_a, **_kw):
+        return {}
+
+    monkeypatch.setattr(service, "get_design_session", _get_session)
+    monkeypatch.setattr(service, "create_adapter", _create_adapter)
+    monkeypatch.setattr(service, "load_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(service, "merge_metadata", _merge_metadata)
+    monkeypatch.setattr(service, "insert_tool_call_record", lambda **_kw: None)
+    monkeypatch.setattr(service, "ensure_preview_dir", lambda: tmp_path)
+    monkeypatch.setattr(preview_service, "refresh_preview", _refresh_preview)
+
+    # Use a fresh key so this test is independent of the module-level lock map.
+    results = await asyncio.gather(
+        service._open_empty_part_before_checkpoint(
+            session_id="concurrent-bootstrap",
+            session_row={"user_goal": "demo", "metadata_json": state["metadata_json"]},
+            db_path=None,
+            api_origin="http://localhost",
+        ),
+        service._open_empty_part_before_checkpoint(
+            session_id="concurrent-bootstrap",
+            session_row={"user_goal": "demo", "metadata_json": state["metadata_json"]},
+            db_path=None,
+            api_origin="http://localhost",
+        ),
+    )
+
+    assert created_count == 1
+    assert {result["status"] for result in results} == {"success", "reused"}
+
+
+@pytest.mark.asyncio
 async def test_execute_next_checkpoint_opens_empty_and_records_failure(
     monkeypatch,
 ) -> None:
@@ -514,6 +667,71 @@ async def test_execute_next_checkpoint_opens_empty_and_records_failure(
     assert result == {"ok": True}
     assert open_calls == ["open"]
     assert any("failed" in call.get("latest_error_text", "") for call in merge_calls)
+
+
+@pytest.mark.asyncio
+async def test_execute_next_checkpoint_serializes_concurrent_requests(monkeypatch) -> None:
+    """Concurrent requests cannot execute the same unexecuted checkpoint twice."""
+    session_row = {
+        "user_goal": "demo",
+        "source_mode": "plan",
+        "accepted_family": None,
+        "metadata_json": json.dumps({"workflow_mode": "edit_existing"}),
+    }
+    checkpoints = [
+        {
+            "id": 1,
+            "checkpoint_index": 0,
+            "title": "First",
+            "executed": False,
+            "planned_action_json": json.dumps({"tools": ["get_model_info"]}),
+        }
+    ]
+    run_count = 0
+
+    from solidworks_mcp.ui.services import session_service
+
+    monkeypatch.setattr(
+        session_service, "ensure_dashboard_session", lambda *_a, **_kw: session_row
+    )
+    monkeypatch.setattr(
+        service, "list_plan_checkpoints", lambda *_a, **_kw: checkpoints
+    )
+
+    async def _run_checkpoint(*_a, **_kw):
+        nonlocal run_count
+        run_count += 1
+        await asyncio.sleep(0)
+        return {
+            "failed_tools": [],
+            "mocked_tools": [],
+            "tool_runs": [{"tool": "get_model_info", "status": "success"}],
+            "script_path": "script.py",
+            "script_text": "",
+            "stdout_text": "",
+            "stderr_text": "",
+            "validation_failures": [],
+        }
+
+    def _mark_executed(_checkpoint_id, **kwargs):
+        checkpoints[0]["executed"] = bool(kwargs.get("executed"))
+
+    monkeypatch.setattr(service, "_run_checkpoint_tools", _run_checkpoint)
+    monkeypatch.setattr(service, "update_plan_checkpoint", _mark_executed)
+    monkeypatch.setattr(service, "insert_tool_call_record", lambda **_kw: None)
+    monkeypatch.setattr(service, "upsert_design_session", lambda *_a, **_kw: None)
+    monkeypatch.setattr(service, "merge_metadata", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        session_service, "build_dashboard_state", lambda *_a, **_kw: {"ok": True}
+    )
+
+    results = await asyncio.gather(
+        service.execute_next_checkpoint("concurrent-session"),
+        service.execute_next_checkpoint("concurrent-session"),
+    )
+
+    assert results == [{"ok": True}, {"ok": True}]
+    assert run_count == 1
 
 
 @pytest.mark.asyncio

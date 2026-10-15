@@ -332,6 +332,12 @@ class _ExportFallbackAdapter:
             execution_time=0.01,
         )
 
+    async def export_drawing_cad(
+        self, file_path: str, format_type: str, model_space: bool
+    ):
+        """Test helper for explicit DWG/DXF export capability."""
+        return await self.export_file(file_path, format_type)
+
 
 @pytest.mark.asyncio
 async def test_export_tools_fallback_and_aliases(mcp_server, mock_config):
@@ -942,8 +948,8 @@ class _ExportNativeAdapter:
         """Test helper for export pdf."""
         return _ok({"fmt": "pdf"})
 
-    async def export_dwg(self, *_args, **_kwargs):
-        """Test helper for export dwg."""
+    async def export_drawing_cad(self, *_args, **_kwargs):
+        """Test helper for explicit DWG/DXF export."""
         return _ok({"fmt": "dwg"})
 
     async def export_image(self, *_args, **_kwargs):

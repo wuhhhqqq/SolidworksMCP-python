@@ -234,6 +234,8 @@ class AdapterFactory:
         """
         return {
             "solidworks_path": config.solidworks_path,
+            "solidworks_year": config.solidworks_year,
+            "solidworks_startup_timeout_seconds": config.solidworks_startup_timeout_seconds,
             "enable_windows_validation": config.enable_windows_validation,
             "debug": config.debug,
             "timeout": 30,  # Default timeout in seconds

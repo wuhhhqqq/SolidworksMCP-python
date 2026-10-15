@@ -17,13 +17,21 @@ from .base import (
     AdapterResult,
     AdapterResultStatus,
     ExtrusionParameters,
+    FeatureCircularPatternParameters,
+    FeatureLinearPatternParameters,
+    FeatureMirrorParameters,
+    HoleWizardParameters,
     LoftParameters,
     MassProperties,
+    OriginPlaneParameters,
+    ReferenceAxisParameters,
+    ReferencePlaneParameters,
     RevolveParameters,
     SolidWorksAdapter,
     SolidWorksFeature,
     SolidWorksModel,
     SweepParameters,
+    ThreadedHoleParameters,
 )
 
 T = TypeVar("T")
@@ -273,8 +281,13 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
                 except Exception as e:
                     logger.warning(f"Failed to initialize adapter {i + 1}: {e}")
 
-            self.pool_initialized = True
+            # An empty pool is not initialized. Leaving it retryable is
+            # essential when SolidWorks is deliberately started later from the
+            # Task Pane; otherwise every following tool waits on an empty queue.
+            self.pool_initialized = bool(self.pool)
             logger.info(f"Connection pool initialized with {len(self.pool)} adapters")
+            if not self.pool:
+                raise Exception("No SolidWorks adapter could be connected")
 
     async def _get_adapter(self, timeout: float = 30.0) -> SolidWorksAdapter:
         """Get an available adapter from the pool.
@@ -382,6 +395,42 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
         """
         await self._initialize_pool()
 
+    async def start_solidworks(
+        self, timeout_seconds: float | None = None
+    ) -> dict[str, Any]:
+        """Launch through one pooled adapter without creating parallel instances."""
+        # Do not initialize all pooled connections here: when SolidWorks is
+        # stopped that would issue several attach attempts. Use the first
+        # existing adapter, or the factory's single backing adapter, instead.
+        async with self._lock:
+            target: Any | None = self.pool[0] if self.pool else None
+            if target is None and self.adapter_factory is not None:
+                target = self.adapter_factory()
+            method = (
+                getattr(target, "start_solidworks", None)
+                if target is not None
+                else None
+            )
+            if not callable(method):
+                raise Exception(
+                    "The configured SolidWorks adapter does not support explicit launch"
+                )
+            result = await self._invoke_with_optional_args(
+                target, "start_solidworks", timeout_seconds
+            )
+
+            # A previously failed attach leaves no queued adapters. Seed the
+            # pool with the successfully launched/connected adapter so the
+            # first tool call does not wait for its normal queue timeout.
+            if target not in self.pool:
+                self.pool.clear()
+                while not self.available_adapters.empty():
+                    self.available_adapters.get_nowait()
+                self.pool.append(target)
+                await self.available_adapters.put(target)
+            self.pool_initialized = True
+            return result
+
     async def disconnect(self) -> None:
         """Disconnect all adapters in the pool.
 
@@ -408,6 +457,39 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
                 break
 
         self.pool_initialized = False
+
+    async def close_all_session_docs(self) -> AdapterResult[None]:
+        """Close session-owned documents for every pooled adapter.
+
+        This only delegates document cleanup; underlying adapters must not
+        call ``ExitApp`` or ``Quit``.
+        """
+        failures: list[str] = []
+        for adapter in self.pool:
+            result, error = await self._attempt_async_with_error(
+                lambda a=adapter: a.close_all_session_docs()
+            )
+            if error is not None:
+                failures.append(str(error))
+            elif result is not None and result.is_error:
+                failures.append(result.error or "unknown error")
+        if failures:
+            return AdapterResult(
+                status=AdapterResultStatus.ERROR,
+                error="Failed to close session documents: " + "; ".join(failures),
+            )
+        return AdapterResult(status=AdapterResultStatus.SUCCESS, data=None)
+
+    async def pack_and_go_assembly(
+        self, source_path: str, target_dir: str, name_prefix: str = ""
+    ) -> AdapterResult[dict[str, Any]]:
+        """Run native Pack-and-Go through one pooled adapter."""
+        return await self._execute_with_pool(
+            "pack_and_go_assembly",
+            lambda adapter: adapter.pack_and_go_assembly(  # type: ignore[attr-defined]
+                source_path, target_dir, name_prefix
+            ),
+        )
 
     def is_connected(self) -> bool:
         """Check if pool is initialized.
@@ -482,6 +564,14 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
         """
         return await self._execute_with_pool(
             "open_model", lambda adapter: adapter.open_model(file_path)
+        )
+
+    async def activate_model(
+        self, name: str, path: str | None = None
+    ) -> AdapterResult[None]:
+        """Activate a model through one pooled adapter connection."""
+        return await self._execute_with_pool(
+            "activate_model", lambda adapter: adapter.activate_model(name, path)
         )
 
     async def close_model(self, save: bool = False) -> AdapterResult[None]:
@@ -586,7 +676,165 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
             "create_drawing", lambda adapter: adapter.create_drawing(name)
         )
 
+    async def get_assembly_component(
+        self, component_name: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Look up one active-assembly component using one pooled adapter."""
+        return await self._execute_with_pool(
+            "get_assembly_component",
+            lambda adapter: adapter.get_assembly_component(component_name),
+        )
+
+    async def list_assembly_mate_entities(
+        self,
+        component_id: str | None = None,
+        entity_types: tuple[str, ...] = ("face", "edge"),
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """List assembly mate entities using one pooled adapter."""
+        return await self._execute_with_pool(
+            "list_assembly_mate_entities",
+            lambda adapter: adapter.list_assembly_mate_entities(
+                component_id, entity_types
+            ),
+        )
+
+    async def create_assembly_mate(
+        self,
+        first_persistent_reference: str,
+        second_persistent_reference: str,
+        *,
+        mate_type: str,
+        alignment: str,
+        flip: bool,
+        distance_m: float,
+        angle_radians: float,
+        for_positioning_only: bool,
+        lock_rotation: bool,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create an assembly mate using one pooled adapter connection."""
+        return await self._execute_with_pool(
+            "create_assembly_mate",
+            lambda adapter: adapter.create_assembly_mate(
+                first_persistent_reference,
+                second_persistent_reference,
+                mate_type=mate_type,
+                alignment=alignment,
+                flip=flip,
+                distance_m=distance_m,
+                angle_radians=angle_radians,
+                for_positioning_only=for_positioning_only,
+                lock_rotation=lock_rotation,
+            ),
+        )
+
     # Feature operations
+
+    async def create_sheet_metal_base_flange(
+        self,
+        sketch_name: str,
+        thickness_mm: float,
+        bend_radius_mm: float,
+        k_factor: float,
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a base flange using one pooled adapter."""
+        return await self._execute_with_pool(
+            "create_sheet_metal_base_flange",
+            lambda adapter: adapter.create_sheet_metal_base_flange(
+                sketch_name, thickness_mm, bend_radius_mm, k_factor
+            ),
+        )
+
+    async def create_sheet_metal_edge_flange(
+        self,
+        edge_persistent_reference: str,
+        length_mm: float,
+        angle_degrees: float,
+        bend_radius_mm: float,
+        k_factor: float,
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create an edge flange using one pooled adapter."""
+        return await self._execute_with_pool(
+            "create_sheet_metal_edge_flange",
+            lambda adapter: adapter.create_sheet_metal_edge_flange(
+                edge_persistent_reference,
+                length_mm,
+                angle_degrees,
+                bend_radius_mm,
+                k_factor,
+            ),
+        )
+
+    async def set_sheet_metal_k_factor(
+        self, k_factor: float
+    ) -> AdapterResult[dict[str, Any]]:
+        """Set the sheet-metal K factor using one pooled adapter."""
+        return await self._execute_with_pool(
+            "set_sheet_metal_k_factor",
+            lambda adapter: adapter.set_sheet_metal_k_factor(k_factor),
+        )
+
+    async def get_sheet_metal_info(self) -> AdapterResult[dict[str, Any]]:
+        """Read sheet-metal state using one pooled adapter."""
+        return await self._execute_with_pool(
+            "get_sheet_metal_info", lambda adapter: adapter.get_sheet_metal_info()
+        )
+
+    async def set_sheet_metal_flat_state(
+        self, flattened: bool
+    ) -> AdapterResult[dict[str, Any]]:
+        """Set sheet-metal flat state using one pooled adapter."""
+        return await self._execute_with_pool(
+            "set_sheet_metal_flat_state",
+            lambda adapter: adapter.set_sheet_metal_flat_state(flattened),
+        )
+
+    async def export_flat_pattern_dxf(
+        self, file_path: str, model_path: str, sheet_metal_options: int
+    ) -> AdapterResult[dict[str, Any]]:
+        """Export one flat pattern using one pooled adapter."""
+        return await self._execute_with_pool(
+            "export_flat_pattern_dxf",
+            lambda adapter: adapter.export_flat_pattern_dxf(
+                file_path, model_path, sheet_metal_options
+            ),
+        )
+
+    async def create_shell(
+        self, face_persistent_references: list[str], thickness_mm: float, outward: bool
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a shell using one pooled adapter."""
+        return await self._execute_with_pool(
+            "create_shell",
+            lambda adapter: adapter.create_shell(
+                face_persistent_references, thickness_mm, outward
+            ),
+        )
+
+    async def create_rib(
+        self,
+        sketch_name: str,
+        thickness_mm: float,
+        draft_angle_degrees: float,
+        direction: str,
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a rib using one pooled adapter."""
+        return await self._execute_with_pool(
+            "create_rib",
+            lambda adapter: adapter.create_rib(
+                sketch_name, thickness_mm, draft_angle_degrees, direction
+            ),
+        )
+
+    async def create_dome(
+        self, face_persistent_reference: str, height_mm: float, reverse_direction: bool
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a dome using one pooled adapter."""
+        return await self._execute_with_pool(
+            "create_dome",
+            lambda adapter: adapter.create_dome(
+                face_persistent_reference, height_mm, reverse_direction
+            ),
+        )
 
     async def create_extrusion(
         self, params: ExtrusionParameters
@@ -619,6 +867,306 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
             "add_fillet", lambda adapter: adapter.add_fillet(radius, edge_names)
         )
 
+    async def add_chamfer(
+        self, distance: float, edge_names: list[str]
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Add an equal-distance chamfer using the active pooled adapter."""
+        return await self._execute_with_pool(
+            "add_chamfer", lambda adapter: adapter.add_chamfer(distance, edge_names)
+        )
+
+    async def create_chamfer(
+        self,
+        edge_persistent_references: list[str],
+        distance_mm: float,
+        angle_degrees: float,
+        chamfer_type: str,
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a persistent-reference chamfer using one pooled adapter."""
+        return await self._execute_with_pool(
+            "create_chamfer",
+            lambda adapter: adapter.create_chamfer(
+                edge_persistent_references, distance_mm, angle_degrees, chamfer_type
+            ),
+        )
+
+    async def list_assembly_mates(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List current assembly mates using one pooled adapter."""
+        return await self._execute_with_pool(
+            "list_assembly_mates", lambda adapter: adapter.list_assembly_mates()
+        )
+
+    async def delete_assembly_mate(
+        self, persistent_reference: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Delete one workflow-owned assembly mate using one pooled adapter."""
+        return await self._execute_with_pool(
+            "delete_assembly_mate",
+            lambda adapter: adapter.delete_assembly_mate(persistent_reference),
+        )
+
+    async def list_part_topology(
+        self, entity_types: tuple[str, ...] = ("face", "edge")
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """List active-part topology using one pooled adapter."""
+        return await self._execute_with_pool(
+            "list_part_topology",
+            lambda adapter: adapter.list_part_topology(entity_types),
+        )
+
+    async def create_section_drawing_view(
+        self,
+        source_view_id: str,
+        cut_start_x_m: float,
+        cut_start_y_m: float,
+        cut_end_x_m: float,
+        cut_end_y_m: float,
+        x_m: float,
+        y_m: float,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create a section drawing view using one pooled adapter."""
+        return await self._execute_with_pool(
+            "create_section_drawing_view",
+            lambda adapter: adapter.create_section_drawing_view(
+                source_view_id,
+                cut_start_x_m,
+                cut_start_y_m,
+                cut_end_x_m,
+                cut_end_y_m,
+                x_m,
+                y_m,
+            ),
+        )
+
+    async def create_auxiliary_drawing_view(
+        self, persistent_reference: str, x_m: float, y_m: float
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create an auxiliary drawing view using one pooled adapter."""
+        return await self._execute_with_pool(
+            "create_auxiliary_drawing_view",
+            lambda adapter: adapter.create_auxiliary_drawing_view(
+                persistent_reference, x_m, y_m
+            ),
+        )
+
+    async def activate_drawing_view(
+        self, view_id: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Activate one drawing view using a pooled adapter."""
+        return await self._execute_with_pool(
+            "activate_drawing_view",
+            lambda adapter: adapter.activate_drawing_view(view_id),
+        )
+
+    async def list_drawing_sheets(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List drawing sheets using one pooled adapter."""
+        return await self._execute_with_pool(
+            "list_drawing_sheets", lambda adapter: adapter.list_drawing_sheets()
+        )
+
+    async def activate_drawing_sheet(
+        self, sheet_name: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Activate one drawing sheet using a pooled adapter."""
+        return await self._execute_with_pool(
+            "activate_drawing_sheet",
+            lambda adapter: adapter.activate_drawing_sheet(sheet_name),
+        )
+
+    async def create_drawing_sheet(
+        self,
+        sheet_name: str,
+        paper_size: str,
+        width_m: float,
+        height_m: float,
+        first_angle_projection: bool,
+        scale_numerator: int,
+        scale_denominator: int,
+        zone_rows: int,
+        zone_columns: int,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create one drawing sheet using a pooled adapter."""
+        return await self._execute_with_pool(
+            "create_drawing_sheet",
+            lambda adapter: adapter.create_drawing_sheet(
+                sheet_name,
+                paper_size,
+                width_m,
+                height_m,
+                first_angle_projection,
+                scale_numerator,
+                scale_denominator,
+                zone_rows,
+                zone_columns,
+            ),
+        )
+
+    async def delete_drawing_sheet(
+        self, sheet_name: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Delete one drawing sheet using a pooled adapter."""
+        return await self._execute_with_pool(
+            "delete_drawing_sheet",
+            lambda adapter: adapter.delete_drawing_sheet(sheet_name),
+        )
+
+    async def rename_drawing_sheet(
+        self, sheet_name: str, new_sheet_name: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Rename one drawing sheet using a pooled adapter."""
+        return await self._execute_with_pool(
+            "rename_drawing_sheet",
+            lambda adapter: adapter.rename_drawing_sheet(sheet_name, new_sheet_name),
+        )
+
+    async def reorder_drawing_sheets(self, sheet_names: list[str]) -> AdapterResult[list[dict[str, Any]]]:
+        return await self._execute_with_pool("reorder_drawing_sheets", lambda adapter: adapter.reorder_drawing_sheets(sheet_names))
+
+    async def update_drawing_view_layout(
+        self,
+        view_id: str,
+        x_m: float | None,
+        y_m: float | None,
+        scale_decimal: float | None,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Update one drawing view layout using a pooled adapter."""
+        return await self._execute_with_pool(
+            "update_drawing_view_layout",
+            lambda adapter: adapter.update_drawing_view_layout(
+                view_id, x_m, y_m, scale_decimal
+            ),
+        )
+
+    async def align_drawing_views(
+        self,
+        view_ids: list[str],
+        direction: str,
+        gap_m: float,
+        start_x_m: float | None,
+        start_y_m: float | None,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Arrange drawing views using one pooled adapter operation."""
+        return await self._execute_with_pool(
+            "align_drawing_views",
+            lambda adapter: adapter.align_drawing_views(
+                view_ids, direction, gap_m, start_x_m, start_y_m
+            ),
+        )
+
+    async def rebuild_drawing(self) -> AdapterResult[dict[str, Any]]:
+        """Rebuild and save the active drawing using one pooled adapter."""
+        return await self._execute_with_pool(
+            "rebuild_drawing", lambda adapter: adapter.rebuild_drawing()
+        )
+
+    async def update_drawing_bom(
+        self, persistent_reference: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Update one workflow-owned BOM using one pooled adapter."""
+        return await self._execute_with_pool(
+            "update_drawing_bom",
+            lambda adapter: adapter.update_drawing_bom(persistent_reference),
+        )
+
+    async def delete_drawing_bom(
+        self, persistent_reference: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Delete one workflow-owned BOM using one pooled adapter."""
+        return await self._execute_with_pool(
+            "delete_drawing_bom",
+            lambda adapter: adapter.delete_drawing_bom(persistent_reference),
+        )
+
+    async def create_drawing_revision_table(
+        self, x_m: float, y_m: float, anchor_type: int, revision: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create a revision table using one pooled adapter."""
+        return await self._execute_with_pool(
+            "create_drawing_revision_table",
+            lambda adapter: adapter.create_drawing_revision_table(
+                x_m, y_m, anchor_type, revision
+            ),
+        )
+
+    async def create_drawing_ordinate_dimension(
+        self, persistent_reference: str, x_m: float, y_m: float, ordinate_type: str
+    ) -> AdapterResult[dict[str, Any]]:
+        return await self._execute_with_pool(
+            "create_drawing_ordinate_dimension",
+            lambda adapter: adapter.create_drawing_ordinate_dimension(
+                persistent_reference, x_m, y_m, ordinate_type
+            ),
+        )
+
+    async def create_drawing_surface_finish(
+        self, persistent_reference: str, x_m: float, y_m: float, symbol: str, value: str
+    ) -> AdapterResult[dict[str, Any]]:
+        return await self._execute_with_pool(
+            "create_drawing_surface_finish",
+            lambda adapter: adapter.create_drawing_surface_finish(
+                persistent_reference, x_m, y_m, symbol, value
+            ),
+        )
+
+    async def create_drawing_weld_symbol(
+        self, persistent_reference: str, x_m: float, y_m: float, weld_type: str, size: str
+    ) -> AdapterResult[dict[str, Any]]:
+        return await self._execute_with_pool(
+            "create_drawing_weld_symbol",
+            lambda adapter: adapter.create_drawing_weld_symbol(
+                persistent_reference, x_m, y_m, weld_type, size
+            ),
+        )
+
+    async def create_drawing_geometric_tolerance(
+        self, persistent_reference: str, x_m: float, y_m: float, tolerance: str, datum: str
+    ) -> AdapterResult[dict[str, Any]]:
+        return await self._execute_with_pool(
+            "create_drawing_geometric_tolerance",
+            lambda adapter: adapter.create_drawing_geometric_tolerance(
+                persistent_reference, x_m, y_m, tolerance, datum
+            ),
+        )
+
+    async def create_drawing_center_mark(
+        self, persistent_reference: str, size_m: float, show_connection_lines: bool
+    ) -> AdapterResult[dict[str, Any]]:
+        return await self._execute_with_pool(
+            "create_drawing_center_mark",
+            lambda adapter: adapter.create_drawing_center_mark(
+                persistent_reference, size_m, show_connection_lines
+            ),
+        )
+
+    async def list_drawing_revisions(
+        self, persistent_reference: str
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """List revision rows using one pooled adapter."""
+        return await self._execute_with_pool(
+            "list_drawing_revisions",
+            lambda adapter: adapter.list_drawing_revisions(persistent_reference),
+        )
+
+    async def add_drawing_revision(
+        self, persistent_reference: str, revision: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Add one revision row using one pooled adapter."""
+        return await self._execute_with_pool(
+            "add_drawing_revision",
+            lambda adapter: adapter.add_drawing_revision(persistent_reference, revision),
+        )
+
+    async def delete_drawing_revision(
+        self, persistent_reference: str, revision_id: int, delete_symbols: bool
+    ) -> AdapterResult[dict[str, Any]]:
+        """Delete one revision row using one pooled adapter."""
+        return await self._execute_with_pool(
+            "delete_drawing_revision",
+            lambda adapter: adapter.delete_drawing_revision(
+                persistent_reference, revision_id, delete_symbols
+            ),
+        )
+
     async def create_revolve(
         self, params: RevolveParameters
     ) -> AdapterResult[SolidWorksFeature]:
@@ -632,6 +1180,73 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
         """
         return await self._execute_with_pool(
             "create_revolve", lambda adapter: adapter.create_revolve(params)
+        )
+
+    async def create_reference_plane(
+        self, params: ReferencePlaneParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create an offset reference plane using a pooled adapter."""
+        return await self._execute_with_pool(
+            "create_reference_plane",
+            lambda adapter: adapter.create_reference_plane(params),
+        )
+
+    async def get_reference_axis(
+        self, params: ReferenceAxisParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Resolve a standard origin axis using a pooled adapter."""
+        return await self._execute_with_pool(
+            "get_reference_axis", lambda adapter: adapter.get_reference_axis(params)
+        )
+
+    async def get_reference_plane(
+        self, params: OriginPlaneParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Resolve a standard origin plane using a pooled adapter."""
+        return await self._execute_with_pool(
+            "get_reference_plane", lambda adapter: adapter.get_reference_plane(params)
+        )
+
+    async def create_feature_linear_pattern(
+        self, params: FeatureLinearPatternParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a feature linear pattern using a pooled adapter."""
+        return await self._execute_with_pool(
+            "create_feature_linear_pattern",
+            lambda adapter: adapter.create_feature_linear_pattern(params),
+        )
+
+    async def create_feature_circular_pattern(
+        self, params: FeatureCircularPatternParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a feature circular pattern using a pooled adapter."""
+        return await self._execute_with_pool(
+            "create_feature_circular_pattern",
+            lambda adapter: adapter.create_feature_circular_pattern(params),
+        )
+
+    async def mirror_feature(
+        self, params: FeatureMirrorParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Mirror one feature using a pooled adapter."""
+        return await self._execute_with_pool(
+            "mirror_feature", lambda adapter: adapter.mirror_feature(params)
+        )
+
+    async def create_hole_wizard(
+        self, params: HoleWizardParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a controlled Hole Wizard feature using a pooled adapter."""
+        return await self._execute_with_pool(
+            "create_hole_wizard", lambda adapter: adapter.create_hole_wizard(params)
+        )
+
+    async def create_tapped_hole(
+        self, params: ThreadedHoleParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a tapped Hole Wizard feature using a pooled adapter."""
+        return await self._execute_with_pool(
+            "create_tapped_hole", lambda adapter: adapter.create_tapped_hole(params)
         )
 
     async def create_sweep(
@@ -679,6 +1294,12 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
             "create_sketch", lambda adapter: adapter.create_sketch(plane)
         )
 
+    async def create_3d_sketch(self) -> AdapterResult[str]:
+        """Create a 3D sketch using one pooled adapter."""
+        return await self._execute_with_pool(
+            "create_3d_sketch", lambda adapter: adapter.create_3d_sketch()
+        )
+
     async def add_line(
         self, x1: float, y1: float, x2: float, y2: float
     ) -> AdapterResult[str]:
@@ -695,6 +1316,24 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
         """
         return await self._execute_with_pool(
             "add_line", lambda adapter: adapter.add_line(x1, y1, x2, y2)
+        )
+
+    async def add_3d_line(
+        self, x1: float, y1: float, z1: float, x2: float, y2: float, z2: float
+    ) -> AdapterResult[str]:
+        """Add a 3D line using one pooled adapter."""
+        return await self._execute_with_pool(
+            "add_3d_line",
+            lambda adapter: adapter.add_3d_line(x1, y1, z1, x2, y2, z2),
+        )
+
+    async def convert_sketch_entities(
+        self, edge_persistent_references: list[str]
+    ) -> AdapterResult[str]:
+        """Convert workflow-owned edges using one pooled adapter."""
+        return await self._execute_with_pool(
+            "convert_sketch_entities",
+            lambda adapter: adapter.convert_sketch_entities(edge_persistent_references),
         )
 
     async def add_centerline(
@@ -716,6 +1355,17 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
             lambda adapter: adapter.add_centerline(x1, y1, x2, y2),
         )
 
+    async def add_sketch_text(
+        self, text: str, x: float, y: float, height: float, angle_degrees: float
+    ) -> AdapterResult[str]:
+        """Add sketch text using one pooled adapter."""
+        return await self._execute_with_pool(
+            "add_sketch_text",
+            lambda adapter: adapter.add_sketch_text(
+                text, x, y, height, angle_degrees
+            ),
+        )
+
     async def add_circle(
         self, center_x: float, center_y: float, radius: float
     ) -> AdapterResult[str]:
@@ -731,6 +1381,12 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
         """
         return await self._execute_with_pool(
             "add_circle", lambda adapter: adapter.add_circle(center_x, center_y, radius)
+        )
+
+    async def add_point(self, x: float, y: float) -> AdapterResult[str]:
+        """Add one sketch point using a pooled adapter."""
+        return await self._execute_with_pool(
+            "add_point", lambda adapter: adapter.add_point(x, y)
         )
 
     async def add_rectangle(
@@ -785,6 +1441,15 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
             ),
         )
 
+    async def sketch_trim(
+        self, entity_id: str, trim_x: float, trim_y: float
+    ) -> AdapterResult[str]:
+        """Trim one active-sketch entity using the pooled adapter."""
+        return await self._execute_with_pool(
+            "sketch_trim",
+            lambda adapter: adapter.sketch_trim(entity_id, trim_x, trim_y),
+        )
+
     async def add_sketch_constraint(
         self,
         entity1: str,
@@ -828,6 +1493,15 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
         return await self._execute_with_pool(
             "check_sketch_fully_defined",
             lambda adapter: adapter.check_sketch_fully_defined(sketch_name),
+        )
+
+    async def check_sketch_feature_use(
+        self, sketch_name: str | None = None, feature_use: str = "boss_extrude"
+    ) -> AdapterResult[dict[str, Any]]:
+        """Check feature-use validity using a pooled adapter."""
+        return await self._execute_with_pool(
+            "check_sketch_feature_use",
+            lambda adapter: adapter.check_sketch_feature_use(sketch_name, feature_use),
         )
 
     async def exit_sketch(self) -> AdapterResult[None]:
@@ -878,6 +1552,12 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
             lambda adapter: adapter.list_features(include_suppressed),
         )
 
+    async def list_open_models(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List open SolidWorks documents using one pooled adapter."""
+        return await self._execute_with_pool(
+            "list_open_models", lambda adapter: adapter.list_open_models()
+        )
+
     async def list_configurations(self) -> AdapterResult[list[str]]:
         """List model configurations using pool.
 
@@ -886,6 +1566,41 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
         """
         return await self._execute_with_pool(
             "list_configurations", lambda adapter: adapter.list_configurations()
+        )
+
+    async def get_configuration(
+        self, configuration_name: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Read one configuration using a pooled adapter."""
+        return await self._execute_with_pool(
+            "get_configuration",
+            lambda adapter: adapter.get_configuration(configuration_name),
+        )
+
+    async def get_selection_state(self) -> AdapterResult[dict[str, Any]]:
+        """Read the active selection through one pooled adapter."""
+        return await self._execute_with_pool(
+            "get_selection_state", lambda adapter: adapter.get_selection_state()
+        )
+
+    async def create_configuration(
+        self, configuration_name: str, description: str = ""
+    ) -> AdapterResult[str]:
+        """Create a model configuration using one pooled adapter."""
+        return await self._execute_with_pool(
+            "create_configuration",
+            lambda adapter: adapter.create_configuration(
+                configuration_name, description
+            ),
+        )
+
+    async def activate_configuration(
+        self, configuration_name: str
+    ) -> AdapterResult[str]:
+        """Activate a model configuration using one pooled adapter."""
+        return await self._execute_with_pool(
+            "activate_configuration",
+            lambda adapter: adapter.activate_configuration(configuration_name),
         )
 
     async def execute_macro(
@@ -935,7 +1650,28 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
             "export_file", lambda adapter: adapter.export_file(file_path, format_type)
         )
 
+    async def export_drawing_cad(
+        self,
+        file_path: str,
+        format_type: str,
+        model_space: bool = True,
+        compatibility_profile: str = "standard",
+    ) -> AdapterResult[None]:
+        """Export a drawing as model-space or paper-space DWG/DXF."""
+        return await self._execute_with_pool(
+            "export_drawing_cad",
+            lambda adapter: adapter.export_drawing_cad(
+                file_path, format_type, model_space, compatibility_profile
+            ),
+        )
+
     # Dimension operations
+
+    async def list_dimensions(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List active-model dimensions using the pooled adapter."""
+        return await self._execute_with_pool(
+            "list_dimensions", lambda adapter: adapter.list_dimensions()
+        )
 
     async def get_dimension(self, name: str) -> AdapterResult[float]:
         """Get dimension using pool.

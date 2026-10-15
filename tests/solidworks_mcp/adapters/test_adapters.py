@@ -6,8 +6,11 @@ mock adapter, circuit breaker, and connection pooling functionality.
 """
 
 import math
+import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import call as mock_call
 
 import pytest
 
@@ -15,7 +18,17 @@ from solidworks_mcp.adapters import (
     AdapterFactory,
     create_adapter,
 )
-from solidworks_mcp.adapters.base import AdapterResult, AdapterResultStatus
+from solidworks_mcp.adapters.base import (
+    AdapterResult,
+    AdapterResultStatus,
+    FeatureCircularPatternParameters,
+    FeatureLinearPatternParameters,
+    FeatureMirrorParameters,
+    HoleWizardParameters,
+    OriginPlaneParameters,
+    ReferenceAxisParameters,
+    ThreadedHoleParameters,
+)
 from solidworks_mcp.adapters.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerAdapter,
@@ -27,7 +40,10 @@ from solidworks_mcp.adapters.connection_pool import (
 )
 from solidworks_mcp.adapters.factory import _register_default_adapters
 from solidworks_mcp.adapters.mock_adapter import MockSolidWorksAdapter
-from solidworks_mcp.adapters.pywin32_adapter import PyWin32Adapter
+from solidworks_mcp.adapters.pywin32_adapter import (
+    PyWin32Adapter,
+    resolve_solidworks_launcher,
+)
 from solidworks_mcp.config import AdapterType
 from solidworks_mcp.exceptions import (
     SolidWorksMCPError,
@@ -67,14 +83,102 @@ class TestAdapterFactory:
             adapter = await create_adapter(mock_config)
             assert isinstance(adapter, MockSolidWorksAdapter)
 
-    def test_adapter_factory_registry(self):
-        """Test that all adapter types are registered."""
-        _register_default_adapters()
-        factory = AdapterFactory()
 
-        # Test that factory has all expected adapter types
-        assert AdapterType.MOCK in factory._adapters
-        assert AdapterType.PYWIN32 in factory._adapters
+def test_resolve_solidworks_launcher_prefers_configured_executable(tmp_path) -> None:
+    executable = tmp_path / "SLDWORKS.exe"
+    executable.touch()
+
+    assert resolve_solidworks_launcher({"solidworks_path": str(executable)}) == (
+        "executable",
+        executable,
+    )
+
+
+def test_invalid_configured_launcher_does_not_fall_back(monkeypatch, tmp_path):
+    fallback = tmp_path / "SLDWORKS.exe"
+    fallback.touch()
+    monkeypatch.setattr(
+        "solidworks_mcp.adapters.pywin32_adapter._solidworks_executable_candidates", lambda config: [fallback],
+    )
+    with pytest.raises(SolidWorksMCPError, match="Configured SolidWorks path is invalid"):
+        resolve_solidworks_launcher({"solidworks_path": str(tmp_path / "missing.exe")})
+
+
+def test_shortcut_target_is_checked_before_selection(monkeypatch, tmp_path):
+    utility = tmp_path / "license-manager.exe"
+    utility.touch()
+    executable = tmp_path / "SLDWORKS.exe"
+    executable.touch()
+    wrong = tmp_path / "SOLIDWORKS Licensing.lnk"
+    wrong.touch()
+    correct = tmp_path / "SOLIDWORKS 2019.lnk"
+    correct.touch()
+    shell = SimpleNamespace(CreateShortcut=lambda path: SimpleNamespace(
+        TargetPath=str(utility if Path(path) == wrong else executable),
+    ))
+    monkeypatch.setattr("solidworks_mcp.adapters.pywin32_adapter.win32com.client.Dispatch", Mock(return_value=shell))
+    monkeypatch.setattr("solidworks_mcp.adapters.pywin32_adapter._solidworks_shortcut_candidates", lambda config: [wrong, correct])
+    assert resolve_solidworks_launcher({}) == ("shortcut", correct)
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_ignores_expected_missing_solidworks_connection() -> None:
+    """Attach-only absence must not block a later explicit launch action."""
+    backing = SimpleNamespace(
+        connect=AsyncMock(
+            side_effect=SolidWorksMCPError(
+                "Failed to connect to SolidWorks: No running SolidWorks instance was found"
+            )
+        )
+    )
+    breaker = CircuitBreakerAdapter(adapter=backing, failure_threshold=1)
+
+    with pytest.raises(SolidWorksMCPError):
+        await breaker.connect()
+
+    assert breaker.state is CircuitState.CLOSED
+    assert breaker.failure_count == 0
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_explicit_start_success_closes_open_breaker() -> None:
+    backing = SimpleNamespace(
+        start_solidworks=AsyncMock(return_value={"started": True}),
+    )
+    breaker = CircuitBreakerAdapter(adapter=backing, failure_threshold=1)
+    breaker.state = CircuitState.OPEN
+    breaker.last_failure_time = 0
+
+    result = await breaker.start_solidworks(30)
+
+    assert result["started"] is True
+    assert breaker.state is CircuitState.CLOSED
+    assert breaker.failure_count == 0
+
+
+@pytest.mark.asyncio
+async def test_connection_pool_explicit_start_seeds_empty_pool() -> None:
+    """A launch from an empty pool must make the first tool immediately usable."""
+    backing = SimpleNamespace(
+        start_solidworks=AsyncMock(return_value={"started": True, "pid": 9}),
+        connect=AsyncMock(),
+        disconnect=AsyncMock(),
+    )
+    pool = ConnectionPoolAdapter(adapter_factory=lambda: backing, pool_size=1)
+
+    result = await pool.start_solidworks(30)
+
+    assert result["started"] is True
+    assert pool.pool_initialized is True
+    assert pool.size == 1
+    assert pool.available_adapters.qsize() == 1
+
+def test_adapter_factory_registry():
+    """Test that all adapter types are registered and collected by pytest."""
+    _register_default_adapters()
+    factory = AdapterFactory()
+    assert AdapterType.MOCK in factory._adapters
+    assert AdapterType.PYWIN32 in factory._adapters
 
 
 class TestMockAdapter:
@@ -97,6 +201,36 @@ class TestMockAdapter:
         # Disconnect
         await mock_adapter.disconnect()
         assert not mock_adapter.is_connected
+
+    @pytest.mark.asyncio
+    async def test_mock_equations_follow_save_as_and_reset_after_disconnect(
+        self, mock_adapter, tmp_path
+    ):
+        """Equation state follows its model path and never leaks across sessions."""
+        await mock_adapter.connect()
+        await mock_adapter.create_part("EquationPart")
+        created = await mock_adapter.set_equation("PlateWidth", "120mm")
+        saved = await mock_adapter.save_file(str(tmp_path / "renamed.sldprt"))
+        renamed_equations = await mock_adapter.list_equations()
+
+        assert created.is_success
+        assert saved.is_success
+        assert renamed_equations.data == [
+            {
+                "index": 0,
+                "name": "PlateWidth",
+                "expression": "120mm",
+                "is_global_variable": True,
+            }
+        ]
+
+        await mock_adapter.disconnect()
+        await mock_adapter.connect()
+        await mock_adapter.create_part("EquationPart")
+        fresh_equations = await mock_adapter.list_equations()
+
+        assert fresh_equations.is_success
+        assert fresh_equations.data == []
 
     @pytest.mark.asyncio
     async def test_mock_adapter_health_check(self, mock_adapter):
@@ -124,6 +258,12 @@ class TestMockAdapter:
         result = await mock_adapter.save_file("test_saved.sldprt")
         assert result.is_success
         assert result.data["file_path"] == "test_saved.sldprt"
+
+        # Save As changes the active-document identity, just as SolidWorks does.
+        activated = await mock_adapter.activate_model(
+            "test_saved.sldprt", "test_saved.sldprt"
+        )
+        assert activated.is_success
 
     @pytest.mark.asyncio
     async def test_mock_adapter_modeling_operations(self, mock_adapter):
@@ -514,6 +654,158 @@ class TestPyWin32AdapterBranches:
         return adapter
 
     @pytest.mark.asyncio
+    async def test_explicit_start_reuses_existing_com_instance(self, monkeypatch):
+        """Explicit launch must not create a second SolidWorks process."""
+        adapter = self._build_adapter(monkeypatch)
+        adapter._com_initialized = True
+        app = SimpleNamespace(
+            RevisionNumber="2019",
+            SetUserPreferenceToggle=Mock(),
+            Visible=False,
+        )
+        monkeypatch.setattr(
+            "solidworks_mcp.adapters.pywin32_adapter.win32com",
+            SimpleNamespace(client=SimpleNamespace(GetActiveObject=Mock(return_value=app))),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "solidworks_mcp.adapters.pywin32_adapter._dynamic_module",
+            SimpleNamespace(Dispatch=Mock(return_value=app)),
+            raising=False,
+        )
+
+        result = await adapter.start_solidworks()
+
+        assert result["already_running"] is True
+        assert result["started"] is False
+        assert result["connected"] is True
+        assert app.Visible is True
+
+    @pytest.mark.asyncio
+    async def test_explicit_start_launches_configured_executable(self, monkeypatch, tmp_path):
+        """Explicit launch waits for the newly started executable to register COM."""
+        executable = tmp_path / "SLDWORKS.exe"
+        executable.touch()
+        adapter = self._build_adapter(monkeypatch)
+        adapter.config_dict["solidworks_path"] = str(executable)
+        adapter.config_dict["solidworks_startup_timeout_seconds"] = 5
+        adapter._com_initialized = True
+        app = SimpleNamespace(
+            RevisionNumber="2019",
+            SetUserPreferenceToggle=Mock(),
+            Visible=False,
+        )
+        active_calls = [RuntimeError("not registered"), app]
+        monkeypatch.setattr(
+            "solidworks_mcp.adapters.pywin32_adapter.win32com",
+            SimpleNamespace(
+                client=SimpleNamespace(GetActiveObject=Mock(side_effect=active_calls))
+            ),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "solidworks_mcp.adapters.pywin32_adapter._dynamic_module",
+            SimpleNamespace(Dispatch=Mock(return_value=app)),
+            raising=False,
+        )
+        process = SimpleNamespace(pid=4321, poll=Mock(return_value=None))
+        monkeypatch.setattr(
+            "solidworks_mcp.adapters.pywin32_adapter.subprocess.Popen",
+            Mock(return_value=process),
+        )
+
+        async def fast_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr(
+            "solidworks_mcp.adapters.pywin32_adapter.asyncio.sleep", fast_sleep
+        )
+
+        result = await adapter.start_solidworks()
+
+        assert result["started"] is True
+        assert result["already_running"] is False
+        assert result["pid"] == 4321
+        assert result["launcher"] == str(executable)
+
+    @pytest.mark.asyncio
+    async def test_existing_process_without_com_is_waited_for_not_relaunched(self, monkeypatch):
+        adapter = self._build_adapter(monkeypatch)
+        adapter._com_initialized = True
+        app = SimpleNamespace(RevisionNumber="2019", SetUserPreferenceToggle=Mock(), Visible=False)
+        monkeypatch.setattr(
+            "solidworks_mcp.adapters.pywin32_adapter.win32com",
+            SimpleNamespace(client=SimpleNamespace(GetActiveObject=Mock(side_effect=[RuntimeError("loading"), app]))),
+        )
+        monkeypatch.setattr(
+            "solidworks_mcp.adapters.pywin32_adapter._dynamic_module",
+            SimpleNamespace(Dispatch=Mock(return_value=app)),
+        )
+        monkeypatch.setattr(
+            "solidworks_mcp.adapters.pywin32_adapter.running_solidworks_process_ids", lambda: (123,),
+        )
+        launch = Mock(side_effect=AssertionError("must not launch twice"))
+        monkeypatch.setattr("solidworks_mcp.adapters.pywin32_adapter.subprocess.Popen", launch)
+        result = await adapter.start_solidworks(5)
+        assert result["started"] is False
+        assert result["already_running"] is True
+        assert result["pid"] == 123
+        launch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_timeout_retains_process_for_retry(self, monkeypatch, tmp_path):
+        adapter = self._build_adapter(monkeypatch)
+        executable = tmp_path / "SLDWORKS.exe"
+        executable.touch()
+        adapter.config_dict["solidworks_path"] = str(executable)
+        coordinator = adapter._session_coordinator
+        monkeypatch.setattr(coordinator, "initialize_com_apartment", Mock())
+        monkeypatch.setattr(coordinator, "uninitialize_com_apartment", Mock())
+        acquire = Mock(return_value=None)
+        monkeypatch.setattr(coordinator, "_try_acquire_active_application", acquire)
+        process = SimpleNamespace(pid=456, poll=Mock(return_value=None))
+        launch = Mock(return_value=process)
+        monkeypatch.setattr("solidworks_mcp.adapters.pywin32_adapter.subprocess.Popen", launch)
+        monkeypatch.setattr("solidworks_mcp.adapters.pywin32_adapter.time", SimpleNamespace(monotonic=Mock(side_effect=[0, 6])))
+        with pytest.raises(SolidWorksMCPError, match="COM"):
+            await adapter.start_solidworks(5)
+        assert adapter._launched_process is process
+        acquire.side_effect = [None, object()]
+        monkeypatch.setattr(coordinator, "_prepare_connected_application", AsyncMock())
+        monkeypatch.setattr("solidworks_mcp.adapters.pywin32_adapter.time", SimpleNamespace(monotonic=Mock(side_effect=[10, 10])))
+        result = await adapter.start_solidworks(5)
+        assert result["started"] is False
+        assert result["pid"] == 456
+        launch.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["connect", "start_solidworks"])
+    async def test_cancelled_connection_cleans_com_before_releasing_lease(self, monkeypatch, method):
+        from solidworks_mcp.adapters import pywin32_adapter as module
+
+        adapter = self._build_adapter(monkeypatch)
+        coordinator = adapter._session_coordinator
+        monkeypatch.setattr(coordinator, "initialize_com_apartment", lambda: setattr(adapter, "_com_initialized", True))
+        monkeypatch.setattr(coordinator, "uninitialize_com_apartment", lambda: setattr(adapter, "_com_initialized", False))
+        app = object()
+        monkeypatch.setattr(coordinator, "acquire_solidworks_application", AsyncMock(return_value=app))
+        monkeypatch.setattr(coordinator, "_try_acquire_active_application", Mock(return_value=app))
+
+        async def cancelled_prepare(app):
+            adapter.swApp = app
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(coordinator, "_prepare_connected_application", cancelled_prepare)
+        with pytest.raises(asyncio.CancelledError):
+            await getattr(adapter, method)()
+        assert adapter.swApp is None
+        assert adapter._com_initialized is False
+        other = object()
+        module.AUTOMATION_PROCESS_LEASE.acquire(other)
+        module.AUTOMATION_PROCESS_LEASE.release(other)
+        assert module.AUTOMATION_PROCESS_LEASE._file is None
+
+    @pytest.mark.asyncio
     async def test_health_check_and_model_info_branches(self, monkeypatch):
         """Test healthy/disconnected checks and model-info default branches."""
         adapter = self._build_adapter(monkeypatch)
@@ -542,6 +834,16 @@ class TestPyWin32AdapterBranches:
         assert info.is_success
         assert info.data["type"] == "Unknown"
         assert info.data["configuration"] == "Default"
+
+        adapter.currentModel = SimpleNamespace(
+            GetTitle=lambda: "Model1",
+            GetPathName=lambda: "C:/tmp/model1.sldprt",
+            GetType=lambda: 1,
+        )
+        limited_info = await adapter.get_model_info()
+        assert limited_info.is_success
+        assert limited_info.data["configuration"] == "Default"
+        assert limited_info.data["feature_count"] == 0
 
     @pytest.mark.asyncio
     async def test_save_export_close_and_dimension_error_paths(self, monkeypatch):
@@ -609,6 +911,205 @@ class TestPyWin32AdapterBranches:
         assert closed.is_success
         assert adapter.currentModel is None
         adapter.swApp.CloseDoc.assert_any_call("Model1")
+
+    @pytest.mark.asyncio
+    async def test_close_model_accepts_string_title_property(self, monkeypatch):
+        """CloseModel supports late-bound COM title properties as well as methods."""
+        adapter = self._build_adapter(monkeypatch)
+        adapter.currentModel = SimpleNamespace(GetTitle="SavedAssembly.sldasm")
+        adapter.swApp = SimpleNamespace(CloseDoc=Mock())
+
+        closed = await adapter.close_model()
+
+        assert closed.is_success
+        assert adapter.currentModel is None
+        adapter.swApp.CloseDoc.assert_called_once_with("SavedAssembly.sldasm")
+
+    @pytest.mark.asyncio
+    async def test_drawing_cad_export_uses_model_space_and_restores_preference(
+        self, monkeypatch
+    ):
+        """DWG/DXF export must not leave the global paper-space option changed."""
+        adapter = self._build_adapter(monkeypatch)
+        model = SimpleNamespace(GetType=Mock(return_value=3), SaveAs3=Mock(return_value=True))
+        adapter.currentModel = model
+        adapter.swApp = SimpleNamespace(
+            ActiveDoc=model,
+            GetUserPreferenceToggle=Mock(return_value=True),
+            SetUserPreferenceToggle=Mock(),
+        )
+        monkeypatch.setattr(
+            "solidworks_mcp.adapters.pywin32_adapter.os.makedirs",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "solidworks_mcp.adapters.pywin32_adapter.os.path.exists",
+            lambda _path: False,
+        )
+
+        result = await adapter.export_drawing_cad("C:/tmp/model-space.dxf", "dxf")
+
+        assert result.is_success
+        adapter.swApp.SetUserPreferenceToggle.assert_has_calls(
+            [mock_call(484, False), mock_call(484, True)]
+        )
+        model.SaveAs3.assert_called_once_with("C:\\tmp\\model-space.dxf", 0, 2)
+
+    @pytest.mark.asyncio
+    async def test_caxa_dxf_export_sets_legacy_preferences_and_restores_them(
+        self, monkeypatch, tmp_path
+    ):
+        """CAXA export must be R12-only and restore every global preference."""
+        adapter = self._build_adapter(monkeypatch)
+        model = SimpleNamespace(GetType=Mock(return_value=3), SaveAs3=Mock(return_value=True))
+        adapter.currentModel = model
+        adapter.swApp = SimpleNamespace(
+            ActiveDoc=model,
+            GetUserPreferenceToggle=Mock(return_value=True),
+            SetUserPreferenceToggle=Mock(),
+            GetUserPreferenceIntegerValue=Mock(return_value=8),
+            SetUserPreferenceIntegerValue=Mock(),
+        )
+        compatibility_data = {"profile": "caxa_2015", "dxf_version": "R12"}
+        normalize = Mock(return_value=compatibility_data)
+        monkeypatch.setattr(
+            "solidworks_mcp.adapters.pywin32_adapter.normalize_for_caxa_2015",
+            normalize,
+        )
+
+        target = tmp_path / "drawing-caxa2015.dxf"
+        result = await adapter.export_drawing_cad(
+            str(target), "dxf", True, "caxa_2015"
+        )
+
+        assert result.is_success
+        assert result.data == compatibility_data
+        assert target.exists() is False
+        adapter.swApp.SetUserPreferenceToggle.assert_has_calls(
+            [
+                mock_call(484, False),
+                mock_call(8, False),
+                mock_call(305, False),
+                mock_call(316, True),
+                mock_call(358, False),
+                mock_call(400, False),
+                mock_call(484, True),
+                mock_call(8, True),
+                mock_call(305, True),
+                mock_call(316, True),
+                mock_call(358, True),
+                mock_call(400, True),
+            ]
+        )
+        adapter.swApp.SetUserPreferenceIntegerValue.assert_has_calls(
+            [mock_call(0, 0), mock_call(0, 8)]
+        )
+        normalize.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_close_all_session_docs_only_closes_tracked_documents(self, monkeypatch):
+        """Session cleanup uses each tracked document's current title."""
+        adapter = self._build_adapter(monkeypatch)
+        first = SimpleNamespace(GetTitle=Mock(return_value="saved-part.sldprt"))
+        second = SimpleNamespace(GetTitle=Mock(return_value="Drawing1"))
+        adapter.swApp = SimpleNamespace(
+            GetDocuments=(first, second),
+            CloseDoc=Mock(),
+        )
+        adapter.currentModel = second
+        adapter._track_session_document(first)
+        adapter._track_session_document(second)
+
+        result = await adapter.close_all_session_docs()
+
+        assert result.is_success
+        assert adapter.currentModel is None
+        assert adapter._session_owned_documents == []
+        assert adapter.swApp.CloseDoc.call_args_list == [
+            mock_call("Drawing1"),
+            mock_call("saved-part.sldprt"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_close_all_session_docs_keeps_documents_that_could_not_close(
+        self, monkeypatch
+    ):
+        """Failed closes remain tracked so cleanup can be retried safely."""
+        adapter = self._build_adapter(monkeypatch)
+        document = SimpleNamespace(GetTitle=Mock(return_value="locked.sldprt"))
+        adapter.swApp = SimpleNamespace(
+            GetDocuments=(document,),
+            CloseDoc=Mock(side_effect=RuntimeError("locked")),
+        )
+        adapter._track_session_document(document)
+
+        result = await adapter.close_all_session_docs()
+
+        assert result.is_error
+        assert adapter._session_owned_documents == [document]
+
+    @pytest.mark.asyncio
+    async def test_close_all_session_docs_does_not_close_replacement_document(
+        self, monkeypatch
+    ):
+        """A stale MCP wrapper must not close a user-reopened replacement."""
+        adapter = self._build_adapter(monkeypatch)
+
+        class _Document:
+            def __init__(self, title: str) -> None:
+                self.title = title
+
+            def GetTitle(self) -> str:
+                return self.title
+
+        original = _Document("fixture.sldprt")
+        replacement = _Document("fixture.sldprt")
+        adapter.swApp = SimpleNamespace(
+            GetDocuments=(replacement,),
+            CloseDoc=Mock(),
+        )
+        adapter._track_session_document(original)
+
+        result = await adapter.close_all_session_docs()
+
+        assert result.is_success
+        assert adapter._session_owned_documents == []
+        adapter.swApp.CloseDoc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_close_all_session_docs_keeps_documents_when_enumeration_fails(
+        self, monkeypatch
+    ):
+        """Cleanup refuses a title-only close when SolidWorks cannot enumerate docs."""
+        adapter = self._build_adapter(monkeypatch)
+        document = SimpleNamespace(GetTitle=Mock(return_value="fixture.sldprt"))
+        adapter.swApp = SimpleNamespace(
+            GetDocuments=Mock(side_effect=RuntimeError("COM busy")),
+            CloseDoc=Mock(),
+        )
+        adapter._track_session_document(document)
+
+        result = await adapter.close_all_session_docs()
+
+        assert result.is_error
+        assert adapter._session_owned_documents == [document]
+        adapter.swApp.CloseDoc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_close_all_session_docs_keeps_documents_when_enumeration_api_missing(
+        self, monkeypatch
+    ):
+        """Cleanup refuses a title-only close when GetDocuments is unavailable."""
+        adapter = self._build_adapter(monkeypatch)
+        document = SimpleNamespace(GetTitle=Mock(return_value="fixture.sldprt"))
+        adapter.swApp = SimpleNamespace(CloseDoc=Mock())
+        adapter._track_session_document(document)
+
+        result = await adapter.close_all_session_docs()
+
+        assert result.is_error
+        assert adapter._session_owned_documents == [document]
+        adapter.swApp.CloseDoc.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_sketch_placeholder_and_exit_paths(self, monkeypatch):
@@ -871,8 +1372,7 @@ class TestPyWin32AdapterBranches:
             "solidworks_mcp.adapters.pywin32_adapter.win32com",
             SimpleNamespace(
                 client=SimpleNamespace(
-                    GetActiveObject=Mock(side_effect=RuntimeError("no running app")),
-                    Dispatch=Mock(return_value=fake_app),
+                    GetActiveObject=Mock(return_value=fake_app),
                     VARIANT=lambda _kind, val: val,
                 )
             ),
@@ -933,8 +1433,12 @@ class TestPyWin32AdapterBranches:
         adapter.currentSketch = object()
         adapter.currentSketchManager = object()
         toggle_call_count = fake_app.SetUserPreferenceToggle.call_count
+        fake_app.ExitApp = Mock()
+        fake_app.Quit = Mock()
         await adapter.disconnect()
         assert fake_app.SetUserPreferenceToggle.call_count == toggle_call_count
+        fake_app.ExitApp.assert_not_called()
+        fake_app.Quit.assert_not_called()
         assert adapter.swApp is None
         assert adapter.currentSketchManager is None
         # CoUninitialize now runs on the ComExecutor thread, not in disconnect() directly.
@@ -1445,6 +1949,7 @@ class TestPyWin32AdapterBranches:
             GetUserPreferenceStringValue=Mock(return_value=""),
             NewDocument=Mock(return_value=None),
         )
+        monkeypatch.setattr(adapter, "_find_bundled_template", lambda _extension: None)
 
         part_result = await adapter.create_part()
         asm_result = await adapter.create_assembly()
@@ -1452,6 +1957,23 @@ class TestPyWin32AdapterBranches:
         assert "No part template configured" in (part_result.error or "")
         assert asm_result.is_error
         assert "No assembly template configured" in (asm_result.error or "")
+
+    def test_finds_standard_installed_template_when_preferences_are_empty(
+        self, monkeypatch, tmp_path
+    ):
+        """Use a standard ProgramData template without modifying SW preferences."""
+        adapter = self._build_adapter(monkeypatch)
+        template = (
+            tmp_path / "SOLIDWORKS" / "SOLIDWORKS 2026" / "templates" / "gb_part.prtdot"
+        )
+        template.parent.mkdir(parents=True)
+        template.write_text("template", encoding="utf-8")
+        monkeypatch.setenv("PROGRAMDATA", str(tmp_path))
+        adapter.swApp = SimpleNamespace(
+            GetUserPreferenceStringValue=Mock(return_value="")
+        )
+
+        assert adapter._resolve_template_path([8, 0], ".prtdot") == str(template)
 
     @pytest.mark.asyncio
     async def test_save_guard_non_numeric_success_and_rebuild_failure(
@@ -2126,6 +2648,29 @@ class TestPyWin32AdapterBranches:
         )
 
     @pytest.mark.asyncio
+    async def test_execute_macro_uses_explicit_manifest_module_name(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A trusted macro manifest can provide its module without parsing the .swp file."""
+        adapter = self._build_adapter(monkeypatch)
+        adapter.swApp = SimpleNamespace(RunMacro2=Mock(return_value=(True, 0)))
+        macro_file = tmp_path / "trusted.swp"
+        macro_file.write_bytes(b"binary VBA project")
+
+        result = await adapter.execute_macro(
+            {
+                "macro_path": str(macro_file),
+                "module_name": "ProvisionedModule",
+                "proc_name": "Main",
+            }
+        )
+
+        assert result.is_success
+        adapter.swApp.RunMacro2.assert_called_once_with(
+            str(macro_file), "ProvisionedModule", "Main", 0, 0
+        )
+
+    @pytest.mark.asyncio
     async def test_export_file_stl_errors_when_extension_missing(
         self, monkeypatch, tmp_path
     ) -> None:
@@ -2481,10 +3026,7 @@ class TestPyWin32AdapterBranches:
             SimpleNamespace(CoInitialize=Mock(), CoUninitialize=Mock()),
             raising=False,
         )
-        fake_client = SimpleNamespace(
-            GetActiveObject=Mock(return_value=None),
-            Dispatch=Mock(return_value=None),
-        )
+        fake_client = SimpleNamespace(GetActiveObject=Mock(return_value=None))
         monkeypatch.setattr(
             "solidworks_mcp.adapters.pywin32_adapter.win32com",
             SimpleNamespace(client=fake_client),
@@ -2495,12 +3037,26 @@ class TestPyWin32AdapterBranches:
         # any box with SolidWorks installed).
         monkeypatch.setattr(
             "solidworks_mcp.adapters.pywin32_adapter._dynamic_module",
-            SimpleNamespace(Dispatch=Mock(return_value=None)),
+            SimpleNamespace(Dispatch=Mock()),
             raising=False,
         )
 
-        with pytest.raises(SolidWorksMCPError, match="instance is None"):
+        async def _fast_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr(
+            "solidworks_mcp.adapters.pywin32_adapter.asyncio.sleep", _fast_sleep
+        )
+
+        with pytest.raises(
+            SolidWorksMCPError, match="Start SolidWorks from the desktop shortcut"
+        ):
             await adapter.connect()
+        assert fake_client.GetActiveObject.call_count == 8
+        _dynamic_module = __import__(
+            "solidworks_mcp.adapters.pywin32_adapter", fromlist=["_dynamic_module"]
+        )._dynamic_module
+        _dynamic_module.Dispatch.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_create_extrusion_and_revolve_feature_none_errors(
@@ -2541,6 +3097,384 @@ class TestPyWin32AdapterBranches:
         assert "Failed to create extrusion feature" in (extrusion_result.error or "")
         assert revolve_result.is_error
         assert "Failed to create revolve feature" in (revolve_result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_create_reference_plane_uses_metre_offset_and_clears_selection(
+        self, monkeypatch
+    ) -> None:
+        """Offset plane creation owns its selection lifecycle on all outcomes."""
+        adapter = self._build_adapter(monkeypatch)
+        clear_selection = Mock(return_value=True)
+        base_plane = SimpleNamespace(Select2=Mock(return_value=True))
+        inserted_plane = SimpleNamespace(Name="Plane1", GetID=lambda: 12)
+        insert_reference_plane = Mock(return_value=inserted_plane)
+        adapter.currentModel = SimpleNamespace(
+            FeatureByName=Mock(return_value=base_plane),
+            ClearSelection2=clear_selection,
+            FeatureManager=SimpleNamespace(InsertRefPlane=insert_reference_plane),
+        )
+
+        result = await adapter.create_reference_plane(
+            SimpleNamespace(base_plane="Front", offset=25.4, reverse_direction=False)
+        )
+
+        assert result.is_success
+        assert result.data.name == "Plane1"
+        assert base_plane.Select2.call_args.args == (False, 0)
+        assert insert_reference_plane.call_args.args == (8, 0.0254, 0, 0.0, 0, 0.0)
+        assert clear_selection.call_count == 2
+
+        adapter.currentModel = SimpleNamespace(
+            FeatureByName=Mock(return_value=None),
+            ClearSelection2=clear_selection,
+        )
+        selection_failed = await adapter.create_reference_plane(
+            SimpleNamespace(base_plane="Top", offset=10.0, reverse_direction=True)
+        )
+
+        assert selection_failed.is_error
+        assert "Top Plane" in (selection_failed.error or "")
+        assert clear_selection.call_count == 4
+
+        extension_select = Mock(return_value=True)
+        adapter.currentModel = SimpleNamespace(
+            FeatureByName=Mock(return_value=None),
+            Extension=SimpleNamespace(SelectByID2=extension_select),
+            ClearSelection2=clear_selection,
+            FeatureManager=SimpleNamespace(
+                InsertRefPlane=Mock(return_value=inserted_plane)
+            ),
+        )
+        fallback = await adapter.create_reference_plane(
+            SimpleNamespace(base_plane="Right", offset=10.0, reverse_direction=False)
+        )
+
+        assert fallback.is_success
+        assert extension_select.call_args.args[0:2] == ("Right Plane", "PLANE")
+        assert clear_selection.call_count == 6
+
+        reverse_insert = Mock(return_value=inserted_plane)
+        adapter.currentModel = SimpleNamespace(
+            FeatureByName=Mock(return_value=base_plane),
+            ClearSelection2=clear_selection,
+            FeatureManager=SimpleNamespace(InsertRefPlane=reverse_insert),
+        )
+        reversed_plane = await adapter.create_reference_plane(
+            SimpleNamespace(base_plane="Front", offset=10.0, reverse_direction=True)
+        )
+
+        assert reversed_plane.is_success
+        assert reverse_insert.call_args.args == (264, 0.01, 0, 0.0, 0, 0.0)
+        assert clear_selection.call_count == 8
+
+    @pytest.mark.asyncio
+    async def test_standard_planes_fall_back_to_feature_tree_for_localized_templates(
+        self, monkeypatch
+    ) -> None:
+        """Standard origin planes remain usable when their display names are localized."""
+        adapter = self._build_adapter(monkeypatch)
+        clear_selection = Mock(return_value=True)
+        front = SimpleNamespace(Name="front-local", GetTypeName2=lambda: "RefPlane")
+        top = SimpleNamespace(Name="top-local", GetTypeName2=lambda: "RefPlane")
+        right = SimpleNamespace(Name="right-local", GetTypeName2=lambda: "RefPlane")
+        front.GetNextFeature = lambda: top
+        top.GetNextFeature = lambda: right
+        right.GetNextFeature = lambda: None
+        for plane in (front, top, right):
+            plane.Select2 = Mock(return_value=True)
+        created = SimpleNamespace(Name="Plane1", GetID=lambda: 12)
+        adapter.currentModel = SimpleNamespace(
+            FirstFeature=front,
+            FeatureByName=Mock(return_value=None),
+            ClearSelection2=clear_selection,
+            FeatureManager=SimpleNamespace(InsertRefPlane=Mock(return_value=created)),
+        )
+
+        reference_plane = await adapter.create_reference_plane(
+            SimpleNamespace(base_plane="Front", offset=10.0, reverse_direction=False)
+        )
+        resolved_plane = await adapter.get_reference_plane(
+            OriginPlaneParameters(plane="Right")
+        )
+
+        assert reference_plane.is_success
+        assert resolved_plane.is_success
+        assert resolved_plane.data.name == "right-local"
+        assert front.Select2.call_args == mock_call(False, 0)
+
+    @pytest.mark.asyncio
+    async def test_standard_planes_fall_back_to_reverse_position_for_localized_templates(
+        self, monkeypatch
+    ) -> None:
+        """Late-bound COM can resolve localized origin planes by position."""
+        adapter = self._build_adapter(monkeypatch)
+        origin = SimpleNamespace(GetTypeName2=lambda: "OriginProfileFeature")
+        right = SimpleNamespace(Name="right-local", GetTypeName2=lambda: "RefPlane")
+        top = SimpleNamespace(Name="top-local", GetTypeName2=lambda: "RefPlane")
+        front = SimpleNamespace(Name="front-local", GetTypeName2=lambda: "RefPlane")
+        features = (origin, right, top, front)
+        adapter.currentModel = SimpleNamespace(
+            FirstFeature=None,
+            FeatureByName=Mock(return_value=None),
+            FeatureByPositionReverse=lambda position: (
+                features[position] if position < len(features) else None
+            ),
+        )
+
+        resolved_front = await adapter.get_reference_plane(
+            OriginPlaneParameters(plane="Front")
+        )
+        resolved_top = await adapter.get_reference_plane(
+            OriginPlaneParameters(plane="Top")
+        )
+        resolved_right = await adapter.get_reference_plane(
+            OriginPlaneParameters(plane="Right")
+        )
+
+        assert resolved_front.is_success
+        assert resolved_top.is_success
+        assert resolved_right.is_success
+        assert resolved_front.data.name == "front-local"
+        assert resolved_top.data.name == "top-local"
+        assert resolved_right.data.name == "right-local"
+
+    @pytest.mark.asyncio
+    async def test_standard_axis_materializes_helper_for_localized_templates(
+        self, monkeypatch
+    ) -> None:
+        """Localized templates create a re-usable axis from two origin planes."""
+        adapter = self._build_adapter(monkeypatch)
+        clear_selection = Mock(return_value=True)
+        front = SimpleNamespace(Name="front-local", GetTypeName2=lambda: "RefPlane")
+        top = SimpleNamespace(Name="top-local", GetTypeName2=lambda: "RefPlane")
+        right = SimpleNamespace(Name="right-local", GetTypeName2=lambda: "RefPlane")
+        front.GetNextFeature = lambda: top
+        top.GetNextFeature = lambda: right
+        right.GetNextFeature = lambda: None
+        for plane in (front, top, right):
+            plane.Select2 = Mock(return_value=True)
+        created_axis = SimpleNamespace(
+            Name="axis-local", GetID=lambda: 9, GetTypeName2=lambda: "RefAxis"
+        )
+        insert_axis = Mock(return_value=True)
+        adapter.currentModel = SimpleNamespace(
+            FirstFeature=front,
+            FeatureByName=Mock(return_value=None),
+            ClearSelection2=clear_selection,
+            FeatureByPositionReverse=lambda position: (
+                created_axis if position == 0 else None
+            ),
+            InsertAxis2=insert_axis,
+        )
+
+        result = await adapter.get_reference_axis(ReferenceAxisParameters(axis="Z"))
+
+        assert result.is_success
+        assert result.data.name == "MCP_OriginAxis_Z"
+        assert result.data.id == "9"
+        assert right.Select2.call_args == mock_call(False, 0)
+        assert top.Select2.call_args == mock_call(True, 0)
+        assert insert_axis.call_args == mock_call(True)
+        assert clear_selection.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_typed_reference_and_feature_operations_use_trusted_names(
+        self, monkeypatch
+    ) -> None:
+        """Typed feature operations select only server-resolved native names."""
+        adapter = self._build_adapter(monkeypatch)
+        clear_selection = Mock(return_value=True)
+        feature = SimpleNamespace(Name="Boss-Extrude1", GetID=lambda: 1)
+        axis = SimpleNamespace(Name="Z Axis", GetID=lambda: 2)
+        plane = SimpleNamespace(Name="Right Plane", GetID=lambda: 3)
+        sketch = SimpleNamespace(Name="Sketch2", GetID=lambda: 4)
+        for candidate in (feature, axis, plane, sketch):
+            candidate.Select2 = Mock(return_value=True)
+        created = SimpleNamespace(Name="Pattern1", GetID=lambda: 10)
+        feature_manager = SimpleNamespace(
+            FeatureLinearPattern4=Mock(return_value=created),
+            FeatureCircularPattern5=Mock(return_value=created),
+            InsertMirrorFeature2=Mock(return_value=created),
+            HoleWizard5=Mock(return_value=created),
+        )
+        adapter.currentModel = SimpleNamespace(
+            FeatureByName=Mock(
+                side_effect=lambda name: {
+                    "Boss-Extrude1": feature,
+                    "Z Axis": axis,
+                    "Right Plane": plane,
+                    "Sketch2": sketch,
+                }.get(name)
+            ),
+            ClearSelection2=clear_selection,
+            FeatureManager=feature_manager,
+        )
+
+        origin_axis = await adapter.get_reference_axis(
+            ReferenceAxisParameters(axis="Z")
+        )
+        origin_plane = await adapter.get_reference_plane(
+            OriginPlaneParameters(plane="Right")
+        )
+        linear = await adapter.create_feature_linear_pattern(
+            FeatureLinearPatternParameters(
+                feature_name="Boss-Extrude1",
+                direction="X",
+                instances=3,
+                spacing=12.5,
+                reverse_direction=True,
+            )
+        )
+        circular = await adapter.create_feature_circular_pattern(
+            FeatureCircularPatternParameters(
+                feature_name="Boss-Extrude1",
+                axis_name="Z Axis",
+                instances=4,
+                angle_degrees=180,
+                reverse_direction=True,
+            )
+        )
+        mirrored = await adapter.mirror_feature(
+            FeatureMirrorParameters(
+                feature_name="Boss-Extrude1", plane_name="Right Plane"
+            )
+        )
+        hole = await adapter.create_hole_wizard(
+            HoleWizardParameters(location_sketch_name="Sketch2", diameter=6, depth=20)
+        )
+        tapped_hole = await adapter.create_tapped_hole(
+            ThreadedHoleParameters(
+                location_sketch_name="Sketch2",
+                thread_size="M6x1.0",
+                depth=20,
+                through_all=True,
+            )
+        )
+
+        assert origin_axis.is_success and origin_axis.data.name == "Z Axis"
+        assert origin_plane.is_success and origin_plane.data.name == "Right Plane"
+        assert linear.is_success and circular.is_success and mirrored.is_success
+        assert hole.is_success and tapped_hole.is_success
+        linear_args = feature_manager.FeatureLinearPattern4.call_args.args
+        assert len(linear_args) == 20
+        assert linear_args == (
+            3,
+            0.0125,
+            1,
+            0.0,
+            True,
+            False,
+            "NULL",
+            "NULL",
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            True,
+            False,
+            False,
+            0,
+            0,
+        )
+        circular_args = feature_manager.FeatureCircularPattern5.call_args.args
+        assert len(circular_args) == 14
+        assert circular_args == (
+            4,
+            pytest.approx(math.pi),
+            True,
+            "NULL",
+            False,
+            True,
+            False,
+            False,
+            False,
+            False,
+            1,
+            0.0,
+            "NULL",
+            False,
+        )
+        assert feature_manager.InsertMirrorFeature2.call_args.args == (
+            False,
+            False,
+            False,
+            False,
+            0,
+        )
+        hole_args = feature_manager.HoleWizard5.call_args_list[0].args
+        assert len(hole_args) == 27
+        assert hole_args[:8] == (
+            2,
+            1,
+            40,
+            "M6",
+            0,
+            0.006,
+            0.02,
+            0.0,
+        )
+        assert hole_args[8:20] == (-1,) * 12
+        assert hole_args[20:] == ("", False, True, True, True, True, False)
+        tapped_hole_args = feature_manager.HoleWizard5.call_args_list[1].args
+        assert len(tapped_hole_args) == 27
+        assert tapped_hole_args[:8] == (4, 1, 43, "M6", 33, 0.0, 0.02, 0.0)
+        assert tapped_hole_args[8:20] == (-1,) * 12
+        assert tapped_hole_args[20:] == ("", False, True, True, True, True, False)
+        assert feature.Select2.call_args_list == [
+            mock_call(False, 4),
+            mock_call(False, 4),
+            mock_call(False, 1),
+        ]
+        assert axis.Select2.call_args == mock_call(True, 1)
+        assert plane.Select2.call_args == mock_call(True, 2)
+        assert sketch.Select2.call_args == mock_call(False, 0)
+        assert clear_selection.call_count == 12
+
+    @pytest.mark.asyncio
+    async def test_create_sketch_custom_plane_does_not_fall_back_to_origin_plane(
+        self, monkeypatch
+    ) -> None:
+        """A missing server-resolved plane must not create a sketch on Front/Top/Right."""
+        adapter = self._build_adapter(monkeypatch)
+        feature_by_name = Mock(return_value=None)
+        adapter.currentModel = SimpleNamespace(
+            FeatureByName=feature_by_name,
+            Extension=SimpleNamespace(SelectByID2=Mock(return_value=False)),
+            SketchManager=SimpleNamespace(InsertSketch=Mock(return_value=None)),
+        )
+
+        result = await adapter.create_sketch("Plane17")
+
+        assert result.is_error
+        assert "Plane17" in (result.error or "")
+        assert [call.args[0] for call in feature_by_name.call_args_list] == [
+            "Plane17",
+            "Plane17",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_create_sketch_clears_selection_when_insert_sketch_fails(
+        self, monkeypatch
+    ) -> None:
+        """A failed sketch insertion cannot contaminate the next COM operation."""
+        adapter = self._build_adapter(monkeypatch)
+        clear_selection = Mock(return_value=True)
+        plane = SimpleNamespace(Select2=Mock(return_value=True))
+        adapter.currentModel = SimpleNamespace(
+            FeatureByName=Mock(return_value=plane),
+            ClearSelection2=clear_selection,
+            SketchManager=SimpleNamespace(
+                InsertSketch=Mock(side_effect=RuntimeError("insert failed"))
+            ),
+        )
+
+        result = await adapter.create_sketch("Plane17")
+
+        assert result.is_error
+        assert clear_selection.call_count == 2
 
     @staticmethod
     def _sketch_tree(*names):
@@ -2600,14 +3534,13 @@ class TestPyWin32AdapterBranches:
     async def test_create_sweep_success_selects_profile_and_path(
         self, monkeypatch
     ) -> None:
-        """create_sweep selects the non-path sketch (mark 1) + path (mark 4)
-        and forwards the constant-twist option to InsertProtrusionSwept4."""
+        """create_sweep selects an explicit profile (mark 1) and path (mark 4)."""
         adapter = self._build_adapter(monkeypatch)
 
         selected: list[tuple] = []
         swept = Mock(return_value=SimpleNamespace(Name="Sweep1", GetID=lambda: 7))
         adapter.currentModel = SimpleNamespace(
-            FirstFeature=self._sketch_tree("Sketch1", "Sketch2"),
+            FirstFeature=self._sketch_tree("Sketch@Profile", "Path@Guide"),
             FeatureByName=self._feature_by_name(selected),
             ClearSelection2=Mock(return_value=True),
             FeatureManager=SimpleNamespace(InsertProtrusionSwept4=swept),
@@ -2615,7 +3548,8 @@ class TestPyWin32AdapterBranches:
 
         result = await adapter.create_sweep(
             SimpleNamespace(
-                path="Sketch2",
+                path="Path@Guide",
+                profile="Sketch@Profile",
                 twist_along_path=True,
                 twist_angle=90.0,
                 merge_result=True,
@@ -2624,13 +3558,13 @@ class TestPyWin32AdapterBranches:
 
         assert result.is_success, result.error
         assert result.data.type == "Sweep"
-        assert result.data.parameters["profile"] == "Sketch1"
-        assert result.data.parameters["path"] == "Sketch2"
+        assert result.data.parameters["profile"] == "Sketch@Profile"
+        assert result.data.parameters["path"] == "Path@Guide"
 
         # Profile selected under mark 1 (append False), path under mark 4
         # (append True). Recorded tuples are (name, append, mark).
-        assert ("Sketch1", False, 1) in selected
-        assert ("Sketch2", True, 4) in selected
+        assert ("Sketch@Profile", False, 1) in selected
+        assert ("Path@Guide", True, 4) in selected
 
         # TwistCtrlOption (arg index 2) == 8 (constant twist along path) and
         # TwistAngle (arg index 15) == 90 degrees in radians.
@@ -2693,6 +3627,7 @@ class TestPyWin32AdapterBranches:
         )
         assert result.is_error
         assert "Sketch1" in (result.error or "")
+        assert adapter.currentModel.ClearSelection2.call_count == 2
 
     @pytest.mark.asyncio
     async def test_create_loft_no_model_and_too_few_profiles(self, monkeypatch) -> None:
@@ -2773,6 +3708,7 @@ class TestPyWin32AdapterBranches:
         )
         assert result.is_error
         assert "Failed to create loft feature" in (result.error or "")
+        assert adapter.currentModel.ClearSelection2.call_count == 2
 
     @pytest.mark.asyncio
     async def test_create_loft_profile_selection_failure(self, monkeypatch) -> None:
@@ -2946,7 +3882,7 @@ class TestPyWin32AdapterBranches:
     async def test_com_coordinator_initialize_skip_and_acquire_failure_paths(
         self, monkeypatch
     ) -> None:
-        """Coordinator should skip duplicate init and raise last COM error after retries."""
+        """Coordinator should skip duplicate init and never COM-start SolidWorks."""
         adapter = self._build_adapter(monkeypatch)
 
         co_init = Mock()
@@ -2970,7 +3906,6 @@ class TestPyWin32AdapterBranches:
             SimpleNamespace(
                 client=SimpleNamespace(
                     GetActiveObject=Mock(side_effect=RuntimeError("active fail")),
-                    Dispatch=Mock(side_effect=RuntimeError("dispatch fail")),
                 )
             ),
             raising=False,
@@ -2979,12 +3914,18 @@ class TestPyWin32AdapterBranches:
         # stub it so the retry loop sees the same RuntimeError surface.
         monkeypatch.setattr(
             "solidworks_mcp.adapters.pywin32_adapter._dynamic_module",
-            SimpleNamespace(Dispatch=Mock(side_effect=RuntimeError("dispatch fail"))),
+            SimpleNamespace(Dispatch=Mock(side_effect=RuntimeError("must not be called"))),
             raising=False,
         )
 
-        with pytest.raises(SolidWorksMCPError, match="dispatch fail"):
+        with pytest.raises(
+            SolidWorksMCPError, match="Start SolidWorks from the desktop shortcut"
+        ):
             await adapter._acquire_solidworks_application()
+        _dynamic_module = __import__(
+            "solidworks_mcp.adapters.pywin32_adapter", fromlist=["_dynamic_module"]
+        )._dynamic_module
+        _dynamic_module.Dispatch.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_com_coordinator_wait_ready_timeout_and_no_revision_branch(
@@ -3488,6 +4429,193 @@ class TestAdapterCompatibilityFixes:
         result = await cb.save_file("C:/tmp/save_compat.sldprt")
 
         assert result.is_success
+
+    @pytest.mark.asyncio
+    async def test_mock_adapter_preserves_drawing_views_after_save_as(self, tmp_path):
+        """Saving a drawing updates the mock view registry to the new document path."""
+        adapter = MockSolidWorksAdapter({})
+        await adapter.connect()
+        await adapter.create_drawing("FixtureDrawing")
+        created = await adapter.create_drawing_view(
+            "C:/controlled/fixture.sldprt", "*Front", 0.1, 0.1
+        )
+        saved = await adapter.save_file(str(tmp_path / "fixture.slddrw"))
+        listed = await adapter.list_drawing_views()
+
+        assert created.is_success
+        assert saved.is_success
+        assert listed.is_success
+        assert listed.data == [created.data]
+
+    @pytest.mark.asyncio
+    async def test_mock_adapter_aligns_drawing_views_with_outline_spacing(self):
+        """Batch alignment updates each listed view in the requested order."""
+        adapter = MockSolidWorksAdapter({})
+        await adapter.connect()
+        await adapter.create_drawing("AlignmentDrawing")
+        first = await adapter.create_drawing_view(
+            "C:/controlled/source.sldprt", "*Front", 0.1, 0.1
+        )
+        second = await adapter.create_drawing_view(
+            "C:/controlled/source.sldprt", "*Top", 0.2, 0.1
+        )
+
+        aligned = await adapter.align_drawing_views(
+            [first.data["view_id"], second.data["view_id"]],
+            "horizontal",
+            0.01,
+            0.1,
+            0.2,
+        )
+
+        assert aligned.is_success
+        assert [view["view_id"] for view in aligned.data["views"]] == [
+            first.data["view_id"],
+            second.data["view_id"],
+        ]
+        assert aligned.data["views"][0]["position_m"] == pytest.approx(
+            {"x": 0.13, "y": 0.2}
+        )
+        assert aligned.data["views"][1]["position_m"] == pytest.approx(
+            {"x": 0.2, "y": 0.2}
+        )
+
+    @pytest.mark.asyncio
+    async def test_mock_adapter_preserves_custom_properties_after_save_as(
+        self, tmp_path
+    ):
+        """Saving a document keeps mock custom properties bound to its new path."""
+        adapter = MockSolidWorksAdapter({})
+        await adapter.connect()
+        await adapter.create_part("PropertyPart", "mm")
+        set_property = await adapter.set_custom_property("PartNumber", "BRKT-001")
+        saved = await adapter.save_file(str(tmp_path / "property-part.sldprt"))
+        listed = await adapter.list_custom_properties()
+
+        assert set_property.is_success
+        assert saved.is_success
+        assert listed.is_success
+        assert listed.data == [
+            {"name": "PartNumber", "value": "BRKT-001", "resolved_value": "BRKT-001"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_forwards_projection_and_custom_properties(self):
+        """New drawing/property APIs retain circuit-breaker protection."""
+        base = MockSolidWorksAdapter({})
+        await base.connect()
+        await base.create_drawing("Fixture")
+        created = await base.create_drawing_view(
+            "C:/controlled/fixture-part.sldprt", "*Front", 0.1, 0.1
+        )
+        cb = CircuitBreakerAdapter(base)
+
+        projected = await cb.create_projected_drawing_view(
+            created.data["view_id"], 0.15, 0.1
+        )
+        set_property = await cb.set_custom_property("DrawingNumber", "DRW-001")
+        properties = await cb.list_custom_properties()
+
+        assert projected.is_success
+        assert set_property.is_success
+        assert properties.is_success
+        assert properties.data == [
+            {"name": "DrawingNumber", "value": "DRW-001", "resolved_value": "DRW-001"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_forwards_assembly_component_operations(self):
+        """Component and mate operations use the same protected adapter path."""
+        base = MockSolidWorksAdapter({})
+        await base.connect()
+        await base.create_assembly("Fixture")
+        cb = CircuitBreakerAdapter(base)
+
+        inserted = await cb.insert_assembly_component(
+            "C:/controlled/fixture-part.sldprt", 0.01, 0.02, 0.03
+        )
+        listed = await cb.list_assembly_components()
+        entities = await cb.list_assembly_mate_entities(entity_types=("face",))
+        mate = await cb.create_assembly_mate(
+            entities.data[0]["persistent_reference"],
+            entities.data[1]["persistent_reference"],
+            mate_type="coincident",
+            alignment="aligned",
+            flip=False,
+            distance_m=0.0,
+            angle_radians=0.0,
+            for_positioning_only=False,
+            lock_rotation=False,
+        )
+
+        assert inserted.is_success
+        assert listed.is_success
+        assert listed.data == [inserted.data]
+        assert entities.is_success
+        assert mate.is_success
+        assert mate.data["mate_type"] == "coincident"
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_forwards_pack_and_go(self):
+        """Pack-and-Go remains available when circuit breaking is enabled."""
+        base = Mock()
+        base.pack_and_go_assembly = AsyncMock(
+            return_value=AdapterResult(
+                status=AdapterResultStatus.SUCCESS,
+                data={"target_dir": "C:/controlled/copy"},
+            )
+        )
+        cb = CircuitBreakerAdapter(base)
+
+        result = await cb.pack_and_go_assembly(
+            "C:/controlled/source.sldasm", "C:/controlled/copy", "2x_"
+        )
+
+        assert result.is_success
+        base.pack_and_go_assembly.assert_awaited_once_with(
+            "C:/controlled/source.sldasm", "C:/controlled/copy", "2x_"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mock_save_file_preserves_assembly_mate_state(self, tmp_path):
+        """Save As preserves mock mate ordering for subsequent assembly operations."""
+        adapter = MockSolidWorksAdapter({})
+        await adapter.connect()
+        await adapter.create_assembly("Fixture")
+        await adapter.insert_assembly_component(
+            "C:/controlled/fixture-part.sldprt", 0.0, 0.0, 0.0
+        )
+        entities = await adapter.list_assembly_mate_entities(entity_types=("face",))
+        first_mate = await adapter.create_assembly_mate(
+            entities.data[0]["persistent_reference"],
+            entities.data[1]["persistent_reference"],
+            mate_type="coincident",
+            alignment="aligned",
+            flip=False,
+            distance_m=0.0,
+            angle_radians=0.0,
+            for_positioning_only=False,
+            lock_rotation=False,
+        )
+        saved = await adapter.save_file(str(tmp_path / "fixture.sldasm"))
+        updated_entities = await adapter.list_assembly_mate_entities(
+            entity_types=("face",)
+        )
+        second_mate = await adapter.create_assembly_mate(
+            updated_entities.data[0]["persistent_reference"],
+            updated_entities.data[1]["persistent_reference"],
+            mate_type="coincident",
+            alignment="aligned",
+            flip=False,
+            distance_m=0.0,
+            angle_radians=0.0,
+            for_positioning_only=False,
+            lock_rotation=False,
+        )
+
+        assert first_mate.is_success
+        assert saved.is_success
+        assert second_mate.data["display_name"] == "Coincident Mate 2"
 
 
 class TestAdapterIntegration:

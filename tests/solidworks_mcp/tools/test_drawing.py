@@ -407,7 +407,7 @@ class TestDrawingToolsBranchCoverage:
             position_y=60.0,
         )
         result = await tool_func(input_data=input_data)
-        assert result["status"] == "success"
+        assert result["status"] == "unsupported"
 
     @pytest.mark.asyncio
     async def test_add_dimension_adapter_error_path(
@@ -456,8 +456,7 @@ class TestDrawingToolsBranchCoverage:
             None,
         )
         result = await tool_func(input_data=input_data)
-        assert result["status"] == "success"
-        assert result["data"]["views_created"] == []
+        assert result["status"] == "unsupported"
 
     @pytest.mark.asyncio
     async def test_create_technical_drawing_adapter_success(
@@ -512,8 +511,7 @@ class TestDrawingToolsBranchCoverage:
             None,
         )
         result = await tool_func(input_data=input_data)
-        assert result["status"] == "success"
-        assert result["data"]["view_name"] == "Front View"
+        assert result["status"] == "unsupported"
 
     # ── add_annotation: adapter error + no-adapter simulation paths ────────
 
@@ -561,8 +559,7 @@ class TestDrawingToolsBranchCoverage:
             None,
         )
         result = await tool_func(input_data=input_data)
-        assert result["status"] == "success"
-        assert result["data"]["annotation_text"] == "MaterialSpec"
+        assert result["status"] == "unsupported"
 
     # ── update_title_block: adapter error + no-adapter paths ───────────────
 
@@ -609,8 +606,7 @@ class TestDrawingToolsBranchCoverage:
             None,
         )
         result = await tool_func(input_data=payload)
-        assert result["status"] == "success"
-        assert result["data"]["title"] == "Widget"
+        assert result["status"] == "unsupported"
 
     @pytest.mark.asyncio
     async def test_typed_drawing_tools_default_error_messages(
@@ -729,11 +725,7 @@ class TestDrawingToolsBranchCoverage:
             }
         )
 
-        assert result["status"] == "success"
-        assert result["dimension"]["entity1"] == "Edge1"
-        assert result["dimension"]["entity2"] == "Edge2"
-        assert result["dimension"]["position"] == {"x": 11.0, "y": 22.0}
-        assert result["dimension"]["precision"] == 3
+        assert result["status"] == "unsupported"
 
     @pytest.mark.asyncio
     async def test_legacy_drawing_tools_success_paths(
@@ -772,13 +764,13 @@ class TestDrawingToolsBranchCoverage:
         auto_dim = await by_name["auto_dimension_view"]({"view_name": "Front"})
         std = await by_name["check_drawing_standards"]({"standard": "ANSI"})
 
-        assert view["status"] == "success"
-        assert note["status"] == "success"
-        assert section["status"] == "success"
-        assert detail["status"] == "success"
-        assert sheet["status"] == "success"
-        assert auto_dim["status"] == "success"
-        assert std["status"] == "success"
+        assert view["status"] == "unsupported"
+        assert note["status"] == "unsupported"
+        assert section["status"] == "unsupported"
+        assert detail["status"] == "unsupported"
+        assert sheet["status"] == "unsupported"
+        assert auto_dim["status"] == "unsupported"
+        assert std["status"] == "unsupported"
 
     @pytest.mark.asyncio
     async def test_legacy_drawing_tools_exception_paths(
@@ -797,7 +789,6 @@ class TestDrawingToolsBranchCoverage:
         r7 = await by_name["check_drawing_standards"](None)
         r8 = await by_name["add_dimension"](object())
 
-        for result in (r1, r2, r3, r4, r5, r8):
-            assert result["status"] == "error"
-        assert r6["status"] == "success"
-        assert r7["status"] == "success"
+        for result in (r1, r2, r3, r4, r5, r6, r7):
+            assert result["status"] == "unsupported"
+        assert r8["status"] == "error"

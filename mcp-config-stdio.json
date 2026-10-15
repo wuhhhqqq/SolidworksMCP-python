@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "solidworks-mcp": {
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "C:\\Apps\\SolidworksMCP-python\\run-mcp-stdio.ps1"
+      ],
+      "env": {
+        "PYTHONUTF8": "1"
+      }
+    }
+  }
+}

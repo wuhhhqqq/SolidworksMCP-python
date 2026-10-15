@@ -18,13 +18,21 @@ from .base import (
     AdapterResult,
     AdapterResultStatus,
     ExtrusionParameters,
+    FeatureCircularPatternParameters,
+    FeatureLinearPatternParameters,
+    FeatureMirrorParameters,
+    HoleWizardParameters,
     LoftParameters,
     MassProperties,
+    OriginPlaneParameters,
+    ReferenceAxisParameters,
+    ReferencePlaneParameters,
     RevolveParameters,
     SolidWorksAdapter,
     SolidWorksFeature,
     SolidWorksModel,
     SweepParameters,
+    ThreadedHoleParameters,
 )
 
 T = TypeVar("T")
@@ -153,8 +161,9 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
         Returns:
             None: None.
         """
-        if self.state == CircuitState.HALF_OPEN:
-            # Reset circuit breaker on success in half-open state
+        if self.state in {CircuitState.OPEN, CircuitState.HALF_OPEN}:
+            # An explicit recovery action, such as starting SolidWorks, is a
+            # successful probe and must close a previously open breaker.
             self.state = CircuitState.CLOSED
             self.failure_count = 0
             self.half_open_calls = 0
@@ -183,6 +192,16 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             logger.warning(
                 f"Circuit breaker opened after {self.failure_count} failures"
             )
+
+    @staticmethod
+    def _is_expected_unavailable_connection(exc: Exception) -> bool:
+        """Recognize attach-only failures while the desktop app is stopped."""
+        current: BaseException | None = exc
+        while current is not None:
+            if "no running solidworks instance was found" in str(current).lower():
+                return True
+            current = current.__cause__ or current.__context__
+        return False
 
     async def _execute_with_circuit_breaker(
         self,
@@ -283,6 +302,25 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
         try:
             await self.adapter.connect()
             self._record_success()
+        except Exception as exc:
+            # A stopped SolidWorks process is expected before a user invokes
+            # the panel's explicit start action. Repeated refreshes should not
+            # open the circuit breaker in that normal state.
+            if not self._is_expected_unavailable_connection(exc):
+                self._record_failure()
+            raise
+
+    async def start_solidworks(
+        self, timeout_seconds: float | None = None
+    ) -> dict[str, Any]:
+        """Explicitly launch SolidWorks through the protected backing adapter."""
+        method = getattr(self.adapter, "start_solidworks", None)
+        if not callable(method):
+            raise Exception("The configured SolidWorks adapter does not support explicit launch")
+        try:
+            result = await self._invoke_with_optional_args(method, timeout_seconds)
+            self._record_success()
+            return result
         except Exception:
             self._record_failure()
             raise
@@ -294,6 +332,26 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             None: None.
         """
         await self.adapter.disconnect()
+
+    async def close_all_session_docs(self) -> AdapterResult[None]:
+        """Forward scoped document cleanup without applying circuit state."""
+        return await self.adapter.close_all_session_docs()
+
+    async def pack_and_go_assembly(
+        self, source_path: str, target_dir: str, name_prefix: str = ""
+    ) -> AdapterResult[dict[str, Any]]:
+        """Forward native assembly Pack-and-Go through the protected adapter."""
+        return await self._execute_with_circuit_breaker(
+            "pack_and_go_assembly",
+            lambda: self.adapter.pack_and_go_assembly(  # type: ignore[attr-defined]
+                source_path, target_dir, name_prefix
+            ),
+            input_dict={
+                "source_path": source_path,
+                "target_dir": target_dir,
+                "name_prefix": name_prefix,
+            },
+        )
 
     def is_connected(self) -> bool:
         """Check connection status.
@@ -341,6 +399,16 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             "open_model",
             lambda: self.adapter.open_model(file_path),
             input_dict={"file_path": file_path},
+        )
+
+    async def activate_model(
+        self, name: str, path: str | None = None
+    ) -> AdapterResult[None]:
+        """Activate a tracked document through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "activate_model",
+            lambda: self.adapter.activate_model(name, path),
+            input_dict={"name": name, "path": path},
         )
 
     async def close_model(self, save: bool = False) -> AdapterResult[None]:
@@ -493,7 +561,322 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             input_dict={"name": name},
         )
 
+    async def insert_assembly_component(
+        self,
+        component_path: str,
+        x_m: float,
+        y_m: float,
+        z_m: float,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Insert one component through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "insert_assembly_component",
+            lambda: self.adapter.insert_assembly_component(
+                component_path, x_m, y_m, z_m
+            ),
+            input_dict={
+                "component_path": component_path,
+                "x_m": x_m,
+                "y_m": y_m,
+                "z_m": z_m,
+            },
+        )
+
+    async def list_assembly_components(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List active assembly components through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "list_assembly_components",
+            lambda: self.adapter.list_assembly_components(),
+            input_dict={},
+        )
+
+    async def get_assembly_component(
+        self, component_name: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Look up one active-assembly component through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "get_assembly_component",
+            lambda: self.adapter.get_assembly_component(component_name),
+            input_dict={"component_name": component_name},
+        )
+
+    async def list_assembly_mate_entities(
+        self,
+        component_id: str | None = None,
+        entity_types: tuple[str, ...] = ("face", "edge"),
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """List internal assembly mate entities through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "list_assembly_mate_entities",
+            lambda: self.adapter.list_assembly_mate_entities(
+                component_id, entity_types
+            ),
+            input_dict={"component_id": component_id, "entity_types": entity_types},
+        )
+
+    async def create_assembly_mate(
+        self,
+        first_persistent_reference: str,
+        second_persistent_reference: str,
+        *,
+        mate_type: str,
+        alignment: str,
+        flip: bool,
+        distance_m: float,
+        angle_radians: float,
+        for_positioning_only: bool,
+        lock_rotation: bool,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create one assembly mate through the circuit breaker without logging tokens."""
+        return await self._execute_with_circuit_breaker(
+            "create_assembly_mate",
+            lambda: self.adapter.create_assembly_mate(
+                first_persistent_reference,
+                second_persistent_reference,
+                mate_type=mate_type,
+                alignment=alignment,
+                flip=flip,
+                distance_m=distance_m,
+                angle_radians=angle_radians,
+                for_positioning_only=for_positioning_only,
+                lock_rotation=lock_rotation,
+            ),
+            input_dict={
+                "mate_type": mate_type,
+                "alignment": alignment,
+                "distance_m": distance_m,
+                "angle_radians": angle_radians,
+            },
+        )
+
+    async def create_drawing_view(
+        self,
+        model_path: str,
+        model_view_name: str,
+        x_m: float,
+        y_m: float,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create one drawing model view through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_drawing_view",
+            lambda: self.adapter.create_drawing_view(
+                model_path, model_view_name, x_m, y_m
+            ),
+            input_dict={
+                "model_path": model_path,
+                "model_view_name": model_view_name,
+                "x_m": x_m,
+                "y_m": y_m,
+            },
+        )
+
+    async def list_drawing_views(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List active drawing model views through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "list_drawing_views",
+            lambda: self.adapter.list_drawing_views(),
+            input_dict={},
+        )
+
+    async def list_assembly_mates(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List current assembly mates through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "list_assembly_mates",
+            lambda: self.adapter.list_assembly_mates(),
+            input_dict={},
+        )
+
+    async def delete_assembly_mate(
+        self, persistent_reference: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Delete a workflow-owned assembly mate without logging its token."""
+        return await self._execute_with_circuit_breaker(
+            "delete_assembly_mate",
+            lambda: self.adapter.delete_assembly_mate(persistent_reference),
+            input_dict={},
+        )
+
+    async def get_drawing_view_outline(
+        self, view_id: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Read one drawing-view outline through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "get_drawing_view_outline",
+            lambda: self.adapter.get_drawing_view_outline(view_id),
+            input_dict={"view_id": view_id},
+        )
+
+    async def create_projected_drawing_view(
+        self, source_view_id: str, x_m: float, y_m: float
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create one projected drawing view through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_projected_drawing_view",
+            lambda: self.adapter.create_projected_drawing_view(
+                source_view_id, x_m, y_m
+            ),
+            input_dict={"source_view_id": source_view_id, "x_m": x_m, "y_m": y_m},
+        )
+
+    async def list_custom_properties(
+        self, configuration_name: str | None = None
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """List custom properties through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "list_custom_properties",
+            lambda: self.adapter.list_custom_properties(configuration_name),
+            input_dict={"configuration_name": configuration_name},
+        )
+
+    async def set_custom_property(
+        self, name: str, value: str, configuration_name: str | None = None
+    ) -> AdapterResult[dict[str, Any]]:
+        """Set one custom property through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "set_custom_property",
+            lambda: self.adapter.set_custom_property(name, value, configuration_name),
+            input_dict={
+                "name": name,
+                "value": value,
+                "configuration_name": configuration_name,
+            },
+        )
+
     # Feature operations
+
+    async def create_sheet_metal_base_flange(
+        self,
+        sketch_name: str,
+        thickness_mm: float,
+        bend_radius_mm: float,
+        k_factor: float,
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a base flange through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_sheet_metal_base_flange",
+            lambda: self.adapter.create_sheet_metal_base_flange(
+                sketch_name, thickness_mm, bend_radius_mm, k_factor
+            ),
+            input_dict={
+                "thickness_mm": thickness_mm,
+                "bend_radius_mm": bend_radius_mm,
+                "k_factor": k_factor,
+            },
+        )
+
+    async def create_sheet_metal_edge_flange(
+        self,
+        edge_persistent_reference: str,
+        length_mm: float,
+        angle_degrees: float,
+        bend_radius_mm: float,
+        k_factor: float,
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create an edge flange through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_sheet_metal_edge_flange",
+            lambda: self.adapter.create_sheet_metal_edge_flange(
+                edge_persistent_reference,
+                length_mm,
+                angle_degrees,
+                bend_radius_mm,
+                k_factor,
+            ),
+            input_dict={
+                "length_mm": length_mm,
+                "angle_degrees": angle_degrees,
+                "bend_radius_mm": bend_radius_mm,
+                "k_factor": k_factor,
+            },
+        )
+
+    async def set_sheet_metal_k_factor(
+        self, k_factor: float
+    ) -> AdapterResult[dict[str, Any]]:
+        """Set a sheet-metal K factor through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "set_sheet_metal_k_factor",
+            lambda: self.adapter.set_sheet_metal_k_factor(k_factor),
+            input_dict={"k_factor": k_factor},
+        )
+
+    async def get_sheet_metal_info(self) -> AdapterResult[dict[str, Any]]:
+        """Read sheet-metal state through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "get_sheet_metal_info",
+            lambda: self.adapter.get_sheet_metal_info(),
+            input_dict={},
+        )
+
+    async def set_sheet_metal_flat_state(
+        self, flattened: bool
+    ) -> AdapterResult[dict[str, Any]]:
+        """Set sheet-metal flat state through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "set_sheet_metal_flat_state",
+            lambda: self.adapter.set_sheet_metal_flat_state(flattened),
+            input_dict={"flattened": flattened},
+        )
+
+    async def export_flat_pattern_dxf(
+        self, file_path: str, model_path: str, sheet_metal_options: int
+    ) -> AdapterResult[dict[str, Any]]:
+        """Export one flat pattern through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "export_flat_pattern_dxf",
+            lambda: self.adapter.export_flat_pattern_dxf(
+                file_path, model_path, sheet_metal_options
+            ),
+            input_dict={"sheet_metal_options": sheet_metal_options},
+        )
+
+    async def create_shell(
+        self, face_persistent_references: list[str], thickness_mm: float, outward: bool
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a shell through the circuit breaker without logging face tokens."""
+        return await self._execute_with_circuit_breaker(
+            "create_shell",
+            lambda: self.adapter.create_shell(
+                face_persistent_references, thickness_mm, outward
+            ),
+            input_dict={
+                "face_count": len(face_persistent_references),
+                "thickness_mm": thickness_mm,
+                "outward": outward,
+            },
+        )
+
+    async def create_rib(
+        self,
+        sketch_name: str,
+        thickness_mm: float,
+        draft_angle_degrees: float,
+        direction: str,
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a rib through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_rib",
+            lambda: self.adapter.create_rib(
+                sketch_name, thickness_mm, draft_angle_degrees, direction
+            ),
+            input_dict={
+                "thickness_mm": thickness_mm,
+                "draft_angle_degrees": draft_angle_degrees,
+                "direction": direction,
+            },
+        )
+
+    async def create_dome(
+        self, face_persistent_reference: str, height_mm: float, reverse_direction: bool
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a dome through the circuit breaker without logging its face token."""
+        return await self._execute_with_circuit_breaker(
+            "create_dome",
+            lambda: self.adapter.create_dome(
+                face_persistent_reference, height_mm, reverse_direction
+            ),
+            input_dict={"height_mm": height_mm, "reverse_direction": reverse_direction},
+        )
 
     async def create_extrusion(
         self, params: ExtrusionParameters
@@ -532,6 +915,354 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             input_dict={"radius": radius, "edge_names": edge_names},
         )
 
+    async def add_chamfer(
+        self, distance: float, edge_names: list[str]
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Add an equal-distance chamfer through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "add_chamfer",
+            lambda: self.adapter.add_chamfer(distance, edge_names),
+            input_dict={"distance": distance, "edge_names": edge_names},
+        )
+
+    async def create_chamfer(
+        self,
+        edge_persistent_references: list[str],
+        distance_mm: float,
+        angle_degrees: float,
+        chamfer_type: str,
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a persistent-reference chamfer through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_chamfer",
+            lambda: self.adapter.create_chamfer(
+                edge_persistent_references, distance_mm, angle_degrees, chamfer_type
+            ),
+            input_dict={
+                "edge_count": len(edge_persistent_references),
+                "distance_mm": distance_mm,
+                "angle_degrees": angle_degrees,
+                "chamfer_type": chamfer_type,
+            },
+        )
+
+    async def create_section_drawing_view(
+        self,
+        source_view_id: str,
+        cut_start_x_m: float,
+        cut_start_y_m: float,
+        cut_end_x_m: float,
+        cut_end_y_m: float,
+        x_m: float,
+        y_m: float,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create a section drawing view through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_section_drawing_view",
+            lambda: self.adapter.create_section_drawing_view(
+                source_view_id,
+                cut_start_x_m,
+                cut_start_y_m,
+                cut_end_x_m,
+                cut_end_y_m,
+                x_m,
+                y_m,
+            ),
+            input_dict={"source_view_id": source_view_id, "x_m": x_m, "y_m": y_m},
+        )
+
+    async def create_auxiliary_drawing_view(
+        self, persistent_reference: str, x_m: float, y_m: float
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create an auxiliary drawing view through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_auxiliary_drawing_view",
+            lambda: self.adapter.create_auxiliary_drawing_view(
+                persistent_reference, x_m, y_m
+            ),
+            input_dict={"x_m": x_m, "y_m": y_m},
+        )
+
+    async def activate_drawing_view(
+        self, view_id: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Activate one drawing view through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "activate_drawing_view",
+            lambda: self.adapter.activate_drawing_view(view_id),
+            input_dict={"view_id": view_id},
+        )
+
+    async def list_drawing_sheets(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List drawing sheets through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "list_drawing_sheets",
+            self.adapter.list_drawing_sheets,
+            input_dict={},
+        )
+
+    async def activate_drawing_sheet(
+        self, sheet_name: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Activate one drawing sheet through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "activate_drawing_sheet",
+            lambda: self.adapter.activate_drawing_sheet(sheet_name),
+            input_dict={"sheet_name": sheet_name},
+        )
+
+    async def create_drawing_sheet(
+        self,
+        sheet_name: str,
+        paper_size: str,
+        width_m: float,
+        height_m: float,
+        first_angle_projection: bool,
+        scale_numerator: int,
+        scale_denominator: int,
+        zone_rows: int,
+        zone_columns: int,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create one drawing sheet through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_drawing_sheet",
+            lambda: self.adapter.create_drawing_sheet(
+                sheet_name,
+                paper_size,
+                width_m,
+                height_m,
+                first_angle_projection,
+                scale_numerator,
+                scale_denominator,
+                zone_rows,
+                zone_columns,
+            ),
+            input_dict={
+                "sheet_name": sheet_name,
+                "paper_size": paper_size,
+                "width_m": width_m,
+                "height_m": height_m,
+                "first_angle_projection": first_angle_projection,
+                "scale_numerator": scale_numerator,
+                "scale_denominator": scale_denominator,
+                "zone_rows": zone_rows,
+                "zone_columns": zone_columns,
+            },
+        )
+
+    async def delete_drawing_sheet(
+        self, sheet_name: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Delete one drawing sheet through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "delete_drawing_sheet",
+            lambda: self.adapter.delete_drawing_sheet(sheet_name),
+            input_dict={"sheet_name": sheet_name},
+        )
+
+    async def rename_drawing_sheet(
+        self, sheet_name: str, new_sheet_name: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Rename one drawing sheet through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "rename_drawing_sheet",
+            lambda: self.adapter.rename_drawing_sheet(sheet_name, new_sheet_name),
+            input_dict={"sheet_name": sheet_name, "new_sheet_name": new_sheet_name},
+        )
+
+    async def reorder_drawing_sheets(self, sheet_names: list[str]) -> AdapterResult[list[dict[str, Any]]]:
+        return await self._execute_with_circuit_breaker("reorder_drawing_sheets", lambda: self.adapter.reorder_drawing_sheets(sheet_names), input_dict={"sheet_names": sheet_names})
+
+    async def update_drawing_view_layout(
+        self,
+        view_id: str,
+        x_m: float | None,
+        y_m: float | None,
+        scale_decimal: float | None,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Update one drawing view layout through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "update_drawing_view_layout",
+            lambda: self.adapter.update_drawing_view_layout(
+                view_id, x_m, y_m, scale_decimal
+            ),
+            input_dict={
+                "view_id": view_id,
+                "x_m": x_m,
+                "y_m": y_m,
+                "scale_decimal": scale_decimal,
+            },
+        )
+
+    async def align_drawing_views(
+        self,
+        view_ids: list[str],
+        direction: str,
+        gap_m: float,
+        start_x_m: float | None,
+        start_y_m: float | None,
+    ) -> AdapterResult[dict[str, Any]]:
+        """Arrange drawing views through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "align_drawing_views",
+            lambda: self.adapter.align_drawing_views(
+                view_ids, direction, gap_m, start_x_m, start_y_m
+            ),
+            input_dict={
+                "view_ids": view_ids,
+                "direction": direction,
+                "gap_m": gap_m,
+                "start_x_m": start_x_m,
+                "start_y_m": start_y_m,
+            },
+        )
+
+    async def rebuild_drawing(self) -> AdapterResult[dict[str, Any]]:
+        """Rebuild and save the active drawing through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "rebuild_drawing",
+            lambda: self.adapter.rebuild_drawing(),
+            input_dict={},
+        )
+
+    async def update_drawing_bom(
+        self, persistent_reference: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Update a workflow-owned drawing BOM through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "update_drawing_bom",
+            lambda: self.adapter.update_drawing_bom(persistent_reference),
+            input_dict={},
+        )
+
+    async def delete_drawing_bom(
+        self, persistent_reference: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Delete a workflow-owned drawing BOM through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "delete_drawing_bom",
+            lambda: self.adapter.delete_drawing_bom(persistent_reference),
+            input_dict={},
+        )
+
+    async def create_drawing_revision_table(
+        self, x_m: float, y_m: float, anchor_type: int, revision: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create a revision table through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_drawing_revision_table",
+            lambda: self.adapter.create_drawing_revision_table(
+                x_m, y_m, anchor_type, revision
+            ),
+            input_dict={
+                "x_m": x_m,
+                "y_m": y_m,
+                "anchor_type": anchor_type,
+                "revision": revision,
+            },
+        )
+
+    async def create_drawing_ordinate_dimension(
+        self, persistent_reference: str, x_m: float, y_m: float, ordinate_type: str
+    ) -> AdapterResult[dict[str, Any]]:
+        return await self._execute_with_circuit_breaker(
+            "create_drawing_ordinate_dimension",
+            lambda: self.adapter.create_drawing_ordinate_dimension(
+                persistent_reference, x_m, y_m, ordinate_type
+            ),
+            input_dict={"persistent_reference": persistent_reference, "x_m": x_m, "y_m": y_m, "ordinate_type": ordinate_type},
+        )
+
+    async def create_drawing_surface_finish(
+        self, persistent_reference: str, x_m: float, y_m: float, symbol: str, value: str
+    ) -> AdapterResult[dict[str, Any]]:
+        return await self._execute_with_circuit_breaker(
+            "create_drawing_surface_finish",
+            lambda: self.adapter.create_drawing_surface_finish(
+                persistent_reference, x_m, y_m, symbol, value
+            ),
+            input_dict={"persistent_reference": persistent_reference, "x_m": x_m, "y_m": y_m, "symbol": symbol, "value": value},
+        )
+
+    async def create_drawing_weld_symbol(
+        self, persistent_reference: str, x_m: float, y_m: float, weld_type: str, size: str
+    ) -> AdapterResult[dict[str, Any]]:
+        return await self._execute_with_circuit_breaker(
+            "create_drawing_weld_symbol",
+            lambda: self.adapter.create_drawing_weld_symbol(
+                persistent_reference, x_m, y_m, weld_type, size
+            ),
+            input_dict={"persistent_reference": persistent_reference, "x_m": x_m, "y_m": y_m, "weld_type": weld_type, "size": size},
+        )
+
+    async def create_drawing_geometric_tolerance(
+        self, persistent_reference: str, x_m: float, y_m: float, tolerance: str, datum: str
+    ) -> AdapterResult[dict[str, Any]]:
+        return await self._execute_with_circuit_breaker(
+            "create_drawing_geometric_tolerance",
+            lambda: self.adapter.create_drawing_geometric_tolerance(
+                persistent_reference, x_m, y_m, tolerance, datum
+            ),
+            input_dict={"persistent_reference": persistent_reference, "x_m": x_m, "y_m": y_m, "tolerance": tolerance, "datum": datum},
+        )
+
+    async def create_drawing_center_mark(
+        self, persistent_reference: str, size_m: float, show_connection_lines: bool
+    ) -> AdapterResult[dict[str, Any]]:
+        return await self._execute_with_circuit_breaker(
+            "create_drawing_center_mark",
+            lambda: self.adapter.create_drawing_center_mark(
+                persistent_reference, size_m, show_connection_lines
+            ),
+            input_dict={"persistent_reference": persistent_reference, "size_m": size_m, "show_connection_lines": show_connection_lines},
+        )
+
+    async def list_drawing_revisions(
+        self, persistent_reference: str
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """List revision rows through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "list_drawing_revisions",
+            lambda: self.adapter.list_drawing_revisions(persistent_reference),
+            input_dict={"persistent_reference": persistent_reference},
+        )
+
+    async def add_drawing_revision(
+        self, persistent_reference: str, revision: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Add one revision row through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "add_drawing_revision",
+            lambda: self.adapter.add_drawing_revision(persistent_reference, revision),
+            input_dict={"persistent_reference": persistent_reference, "revision": revision},
+        )
+
+    async def delete_drawing_revision(
+        self, persistent_reference: str, revision_id: int, delete_symbols: bool
+    ) -> AdapterResult[dict[str, Any]]:
+        """Delete one revision row through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "delete_drawing_revision",
+            lambda: self.adapter.delete_drawing_revision(
+                persistent_reference, revision_id, delete_symbols
+            ),
+            input_dict={
+                "persistent_reference": persistent_reference,
+                "revision_id": revision_id,
+                "delete_symbols": delete_symbols,
+            },
+        )
+
+    async def list_part_topology(
+        self, entity_types: tuple[str, ...] = ("face", "edge")
+    ) -> AdapterResult[list[dict[str, Any]]]:
+        """List active part topology through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "list_part_topology",
+            lambda: self.adapter.list_part_topology(entity_types),
+            input_dict={"entity_types": entity_types},
+        )
+
     async def create_revolve(
         self, params: RevolveParameters
     ) -> AdapterResult[SolidWorksFeature]:
@@ -546,6 +1277,86 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
         return await self._execute_with_circuit_breaker(
             "create_revolve",
             lambda: self.adapter.create_revolve(params),
+            input_dict=_to_input_dict(params),
+        )
+
+    async def create_reference_plane(
+        self, params: ReferencePlaneParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create an offset reference plane through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_reference_plane",
+            lambda: self.adapter.create_reference_plane(params),
+            input_dict=_to_input_dict(params),
+        )
+
+    async def get_reference_axis(
+        self, params: ReferenceAxisParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Resolve a standard origin axis through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "get_reference_axis",
+            lambda: self.adapter.get_reference_axis(params),
+            input_dict=_to_input_dict(params),
+        )
+
+    async def get_reference_plane(
+        self, params: OriginPlaneParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Resolve a standard origin plane through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "get_reference_plane",
+            lambda: self.adapter.get_reference_plane(params),
+            input_dict=_to_input_dict(params),
+        )
+
+    async def create_feature_linear_pattern(
+        self, params: FeatureLinearPatternParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a feature linear pattern through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_feature_linear_pattern",
+            lambda: self.adapter.create_feature_linear_pattern(params),
+            input_dict=_to_input_dict(params),
+        )
+
+    async def create_feature_circular_pattern(
+        self, params: FeatureCircularPatternParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a feature circular pattern through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_feature_circular_pattern",
+            lambda: self.adapter.create_feature_circular_pattern(params),
+            input_dict=_to_input_dict(params),
+        )
+
+    async def mirror_feature(
+        self, params: FeatureMirrorParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Mirror one feature through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "mirror_feature",
+            lambda: self.adapter.mirror_feature(params),
+            input_dict=_to_input_dict(params),
+        )
+
+    async def create_hole_wizard(
+        self, params: HoleWizardParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a controlled Hole Wizard feature through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_hole_wizard",
+            lambda: self.adapter.create_hole_wizard(params),
+            input_dict=_to_input_dict(params),
+        )
+
+    async def create_tapped_hole(
+        self, params: ThreadedHoleParameters
+    ) -> AdapterResult[SolidWorksFeature]:
+        """Create a tapped Hole Wizard feature through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_tapped_hole",
+            lambda: self.adapter.create_tapped_hole(params),
             input_dict=_to_input_dict(params),
         )
 
@@ -600,6 +1411,12 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             input_dict={"plane": plane},
         )
 
+    async def create_3d_sketch(self) -> AdapterResult[str]:
+        """Create a 3D sketch through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_3d_sketch", lambda: self.adapter.create_3d_sketch(), input_dict={}
+        )
+
     async def add_line(
         self, x1: float, y1: float, x2: float, y2: float
     ) -> AdapterResult[str]:
@@ -618,6 +1435,26 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             "add_line",
             lambda: self.adapter.add_line(x1, y1, x2, y2),
             input_dict={"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+        )
+
+    async def add_3d_line(
+        self, x1: float, y1: float, z1: float, x2: float, y2: float, z2: float
+    ) -> AdapterResult[str]:
+        """Add a 3D line through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "add_3d_line",
+            lambda: self.adapter.add_3d_line(x1, y1, z1, x2, y2, z2),
+            input_dict={"x1": x1, "y1": y1, "z1": z1, "x2": x2, "y2": y2, "z2": z2},
+        )
+
+    async def convert_sketch_entities(
+        self, edge_persistent_references: list[str]
+    ) -> AdapterResult[str]:
+        """Convert workflow-owned edges through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "convert_sketch_entities",
+            lambda: self.adapter.convert_sketch_entities(edge_persistent_references),
+            input_dict={"edge_count": len(edge_persistent_references)},
         )
 
     async def add_centerline(
@@ -640,6 +1477,24 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             input_dict={"x1": x1, "y1": y1, "x2": x2, "y2": y2},
         )
 
+    async def add_sketch_text(
+        self, text: str, x: float, y: float, height: float, angle_degrees: float
+    ) -> AdapterResult[str]:
+        """Add sketch text through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "add_sketch_text",
+            lambda: self.adapter.add_sketch_text(
+                text, x, y, height, angle_degrees
+            ),
+            input_dict={
+                "text": text,
+                "x": x,
+                "y": y,
+                "height": height,
+                "angle_degrees": angle_degrees,
+            },
+        )
+
     async def add_circle(
         self, center_x: float, center_y: float, radius: float
     ) -> AdapterResult[str]:
@@ -657,6 +1512,14 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             "add_circle",
             lambda: self.adapter.add_circle(center_x, center_y, radius),
             input_dict={"center_x": center_x, "center_y": center_y, "radius": radius},
+        )
+
+    async def add_point(self, x: float, y: float) -> AdapterResult[str]:
+        """Add one sketch point through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "add_point",
+            lambda: self.adapter.add_point(x, y),
+            input_dict={"x": x, "y": y},
         )
 
     async def add_rectangle(
@@ -830,6 +1693,16 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             },
         )
 
+    async def sketch_trim(
+        self, entity_id: str, trim_x: float, trim_y: float
+    ) -> AdapterResult[str]:
+        """Trim one active-sketch entity through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "sketch_trim",
+            lambda: self.adapter.sketch_trim(entity_id, trim_x, trim_y),
+            input_dict={"entity_id": entity_id, "trim_x": trim_x, "trim_y": trim_y},
+        )
+
     async def add_sketch_constraint(
         self,
         entity1: str,
@@ -888,6 +1761,16 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             input_dict={"sketch_name": sketch_name},
         )
 
+    async def check_sketch_feature_use(
+        self, sketch_name: str | None = None, feature_use: str = "boss_extrude"
+    ) -> AdapterResult[dict[str, Any]]:
+        """Check native feature-use validity through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "check_sketch_feature_use",
+            lambda: self.adapter.check_sketch_feature_use(sketch_name, feature_use),
+            input_dict={"sketch_name": sketch_name, "feature_use": feature_use},
+        )
+
     async def exit_sketch(self) -> AdapterResult[None]:
         """Exit sketch through circuit breaker.
 
@@ -912,6 +1795,40 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             "get_mass_properties",
             lambda: self.adapter.get_mass_properties(),
             input_dict={},
+        )
+
+    async def get_bounding_box(self) -> AdapterResult[dict[str, list[float]]]:
+        """Read active-part extents through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "get_bounding_box",
+            lambda: self.adapter.get_bounding_box(),
+            input_dict={},
+        )
+
+    async def list_equations(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List active-part equations through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "list_equations",
+            lambda: self.adapter.list_equations(),
+            input_dict={},
+        )
+
+    async def set_equation(
+        self, name: str, expression: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Create or update an equation through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "set_equation",
+            lambda: self.adapter.set_equation(name, expression),
+            input_dict={"name": name, "expression": expression},
+        )
+
+    async def delete_equation(self, name: str) -> AdapterResult[dict[str, Any]]:
+        """Delete an equation through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "delete_equation",
+            lambda: self.adapter.delete_equation(name),
+            input_dict={"name": name},
         )
 
     async def get_model_info(self) -> AdapterResult[dict[str, object]]:
@@ -943,6 +1860,14 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             input_dict={"include_suppressed": include_suppressed},
         )
 
+    async def list_open_models(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List open SolidWorks documents through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "list_open_models",
+            lambda: self.adapter.list_open_models(),
+            input_dict={},
+        )
+
     async def list_configurations(self) -> AdapterResult[list[str]]:
         """List model configurations through circuit breaker.
 
@@ -953,6 +1878,47 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             "list_configurations",
             lambda: self.adapter.list_configurations(),
             input_dict={},
+        )
+
+    async def get_configuration(
+        self, configuration_name: str
+    ) -> AdapterResult[dict[str, Any]]:
+        """Read one configuration through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "get_configuration",
+            lambda: self.adapter.get_configuration(configuration_name),
+            input_dict={"configuration_name": configuration_name},
+        )
+
+    async def get_selection_state(self) -> AdapterResult[dict[str, Any]]:
+        """Read the active selection through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "get_selection_state",
+            lambda: self.adapter.get_selection_state(),
+            input_dict={},
+        )
+
+    async def create_configuration(
+        self, configuration_name: str, description: str = ""
+    ) -> AdapterResult[str]:
+        """Create a model configuration through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "create_configuration",
+            lambda: self.adapter.create_configuration(configuration_name, description),
+            input_dict={
+                "configuration_name": configuration_name,
+                "description": description,
+            },
+        )
+
+    async def activate_configuration(
+        self, configuration_name: str
+    ) -> AdapterResult[str]:
+        """Activate a model configuration through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "activate_configuration",
+            lambda: self.adapter.activate_configuration(configuration_name),
+            input_dict={"configuration_name": configuration_name},
         )
 
     # Export operations
@@ -990,7 +1956,35 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
             input_dict={"file_path": file_path, "format_type": format_type},
         )
 
+    async def export_drawing_cad(
+        self,
+        file_path: str,
+        format_type: str,
+        model_space: bool = True,
+        compatibility_profile: str = "standard",
+    ) -> AdapterResult[None]:
+        """Export a drawing as model-space or paper-space DWG/DXF."""
+        return await self._execute_with_circuit_breaker(
+            "export_drawing_cad",
+            lambda: self.adapter.export_drawing_cad(
+                file_path, format_type, model_space, compatibility_profile
+            ),
+            input_dict={
+                "file_path": file_path,
+                "format_type": format_type,
+                "model_space": model_space,
+                "compatibility_profile": compatibility_profile,
+            },
+        )
+
     # Dimension operations
+
+    async def list_dimensions(self) -> AdapterResult[list[dict[str, Any]]]:
+        """List active-model dimensions through the circuit breaker."""
+        return await self._execute_with_circuit_breaker(
+            "list_dimensions",
+            lambda: self.adapter.list_dimensions(),
+        )
 
     async def get_dimension(self, name: str) -> AdapterResult[float]:
         """Get dimension through circuit breaker.

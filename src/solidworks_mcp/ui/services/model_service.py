@@ -366,6 +366,17 @@ async def connect_target_model(
                 "[ui.connect_target_model] post-attach preview refresh failed: {}",
                 str(refresh_exc),
             )
+        finally:
+            # ``refresh_preview`` deliberately does not own an adapter passed
+            # through ``adapter_override``. Release this short-lived adapter
+            # here on both success and preview failure; otherwise every target
+            # model attach leaves a COM apartment and document wrapper alive.
+            if adapter is not None:
+                try:
+                    await adapter.disconnect()
+                except Exception:
+                    logger.debug("Adapter disconnect failed after target-model preview")
+            adapter = None
 
     if adapter is not None:
         try:

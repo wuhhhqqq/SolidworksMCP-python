@@ -671,6 +671,101 @@ class TestMockAdapterSuccessPaths:
         assert result.status == AdapterResultStatus.ERROR
         assert "Unknown sketch entity" in (result.error or "")
 
+    @pytest.mark.asyncio
+    async def test_sketch_trim_requires_one_registered_active_sketch_entity(self):
+        """Mock trimming preserves the registered entity ID and rejects stale input."""
+        adapter = MockSolidWorksAdapter({})
+        await adapter.connect()
+        await adapter.create_part()
+        await adapter.create_sketch("Front")
+        line = await adapter.add_line(0.0, 0.0, 50.0, 0.0)
+
+        result = await adapter.sketch_trim(line.data, 25.0, 0.0)
+        assert result.status == AdapterResultStatus.SUCCESS
+        assert result.data == line.data
+
+        unknown = await adapter.sketch_trim("Bogus_42", 25.0, 0.0)
+        assert unknown.status == AdapterResultStatus.ERROR
+        assert "Unknown sketch entity" in (unknown.error or "")
+
+
+class TestRealSketchTrimImpl:
+    """Direct COM-shape tests for ``_sketch_trim_impl`` with no SolidWorks process."""
+
+    @staticmethod
+    def _build_adapter(sketch_manager: object) -> tuple[SimpleNamespace, Mock]:
+        entity = Mock()
+        entity.Select4 = Mock(return_value=True)
+        select_data = SimpleNamespace(Mark=None)
+        selection_manager = SimpleNamespace(CreateSelectData=Mock(return_value=select_data))
+        current_model = SimpleNamespace(
+            ClearSelection2=Mock(return_value=True),
+            SelectionManager=selection_manager,
+        )
+
+        def _handle(_name, fn):
+            try:
+                return AdapterResult(status=AdapterResultStatus.SUCCESS, data=fn())
+            except Exception as exc:
+                return AdapterResult(status=AdapterResultStatus.ERROR, error=str(exc))
+
+        def _attempt(fn, default=None):
+            try:
+                return fn()
+            except Exception:
+                return default
+
+        adapter = SimpleNamespace(
+            _sketch_entities={"Line_1": entity},
+            currentSketchManager=sketch_manager,
+            currentModel=current_model,
+            _handle_com_operation=_handle,
+            _attempt=_attempt,
+        )
+        return adapter, entity
+
+    def test_uses_sketch_trim5_with_millimetres_converted_to_metres(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        from solidworks_mcp.adapters.solidworks import sketch as sketch_ops
+
+        monkeypatch.setattr(sketch_ops._sw_type_info, "flag_methods", lambda *_: 0)
+        trim = Mock(return_value=True)
+        adapter, entity = self._build_adapter(SimpleNamespace(SketchTrim5=trim))
+
+        result = sketch_ops._sketch_trim_impl(adapter, "Line_1", 25.0, -10.0)
+
+        assert result.status == AdapterResultStatus.SUCCESS
+        assert result.data == "Line_1"
+        trim.assert_called_once_with(0, 0.025, -0.01, 0.0)
+        entity.Select4.assert_called_once()
+        assert adapter.currentModel.ClearSelection2.call_count == 2
+
+    def test_falls_back_to_legacy_sketch_trim_when_trim5_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        from solidworks_mcp.adapters.solidworks import sketch as sketch_ops
+
+        monkeypatch.setattr(sketch_ops._sw_type_info, "flag_methods", lambda *_: 0)
+        legacy_trim = Mock(return_value=True)
+
+        class _LegacySketchManager:
+            SketchTrim = legacy_trim
+
+            def __getattr__(self, name: str) -> object:
+                if name == "SketchTrim5":
+                    raise RuntimeError("Member not found")
+                raise AttributeError(name)
+
+        adapter, _ = self._build_adapter(
+            _LegacySketchManager()
+        )
+
+        result = sketch_ops._sketch_trim_impl(adapter, "Line_1", 4.0, 3.0)
+
+        assert result.status == AdapterResultStatus.SUCCESS
+        legacy_trim.assert_called_once_with(0, 0.004, 0.003, 0.0)
+
 
 # ---------------------------------------------------------------------------
 # Real (PyWin32) circular pattern impl — fake SketchManager unit tests
@@ -949,6 +1044,23 @@ class TestCircuitBreakerCoverage:
         return cb, inner
 
     @pytest.mark.asyncio
+    async def test_sheet_metal_io_delegates_to_the_wrapped_adapter(self):
+        """Wrapper-only deployments must not fall back to base stubs."""
+        cb, inner = self._make_cb()
+        info = AdapterResult(status=AdapterResultStatus.SUCCESS, data={"is_sheet_metal": True})
+        flat = AdapterResult(status=AdapterResultStatus.SUCCESS, data={"is_flattened": True})
+        exported = AdapterResult(status=AdapterResultStatus.SUCCESS, data={"path": "flat.dxf"})
+        inner.get_sheet_metal_info = AsyncMock(return_value=info)
+        inner.set_sheet_metal_flat_state = AsyncMock(return_value=flat)
+        inner.export_flat_pattern_dxf = AsyncMock(return_value=exported)
+
+        assert await cb.get_sheet_metal_info() is info
+        assert await cb.set_sheet_metal_flat_state(True) is flat
+        assert await cb.export_flat_pattern_dxf("flat.dxf", "part.sldprt", 21) is exported
+        inner.set_sheet_metal_flat_state.assert_awaited_once_with(True)
+        inner.export_flat_pattern_dxf.assert_awaited_once_with("flat.dxf", "part.sldprt", 21)
+
+    @pytest.mark.asyncio
     async def test_record_failure_half_open_to_open(self):
         """Line 119 — HALF_OPEN failure → back to OPEN."""
         cb, inner = self._make_cb(failure_threshold=1)
@@ -1051,6 +1163,25 @@ class TestCircuitBreakerCoverage:
         assert result.status == AdapterResultStatus.SUCCESS
 
     @pytest.mark.asyncio
+    async def test_bounding_box_and_equation_wrappers_use_circuit_breaker(self):
+        """New part inspection and equation writes reach the wrapped adapter."""
+        cb, inner = self._make_cb()
+        await inner.connect()
+        await inner.create_part()
+
+        bounding_box = await cb.get_bounding_box()
+        created = await cb.set_equation("Clearance", "0.25mm")
+        equations = await cb.list_equations()
+        deleted = await cb.delete_equation("Clearance")
+
+        assert bounding_box.status == AdapterResultStatus.SUCCESS
+        assert bounding_box.data["size_mm"] == [100.0, 50.0, 25.0]
+        assert created.status == AdapterResultStatus.SUCCESS
+        assert equations.status == AdapterResultStatus.SUCCESS
+        assert equations.data[0]["name"] == "Clearance"
+        assert deleted.status == AdapterResultStatus.SUCCESS
+
+    @pytest.mark.asyncio
     async def test_list_features_via_circuit_breaker(self):
         """Line 375 — list_features delegates through circuit breaker."""
         cb, inner = self._make_cb()
@@ -1067,6 +1198,18 @@ class TestCircuitBreakerCoverage:
         await inner.create_part()
         result = await cb.list_configurations()
         assert result.status == AdapterResultStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_create_configuration_via_circuit_breaker(self):
+        """Configuration creation delegates through the circuit breaker."""
+        cb, inner = self._make_cb()
+        await inner.connect()
+        await inner.create_part()
+
+        result = await cb.create_configuration("Fabrication", "Coverage test")
+
+        assert result.status == AdapterResultStatus.SUCCESS
+        assert result.data == "Fabrication"
 
     @pytest.mark.asyncio
     async def test_remaining_circuit_breaker_wrappers(self):
@@ -1094,6 +1237,7 @@ class TestCircuitBreakerCoverage:
         inner.create_assembly = AsyncMock(return_value=model_result)
         inner.create_cut_extrude = AsyncMock(return_value=feature_result)
         inner.add_fillet = AsyncMock(return_value=feature_result)
+        inner.add_chamfer = AsyncMock(return_value=feature_result)
         inner.add_arc = AsyncMock(
             return_value=AdapterResult(status=AdapterResultStatus.SUCCESS, data="Arc1")
         )
@@ -1117,6 +1261,7 @@ class TestCircuitBreakerCoverage:
         default_assembly_result = await cb.create_assembly()
         cut_result = await cb.create_cut_extrude(extrusion)
         fillet_result = await cb.add_fillet(1.5, ["Edge1"])
+        chamfer_result = await cb.add_chamfer(1.0, ["Edge1"])
         macro_exec = await cb.execute_macro({"name": "macro"})
         arc_result = await cb.add_arc(0.0, 0.0, 1.0, 0.0, 0.0, 1.0)
         dim_result = await cb.add_sketch_dimension("Line1", None, "linear", 5.0)
@@ -1130,6 +1275,7 @@ class TestCircuitBreakerCoverage:
         assert default_assembly_result is model_result
         assert cut_result is feature_result
         assert fillet_result is feature_result
+        assert chamfer_result is feature_result
         assert macro_exec is macro_result
         assert arc_result.status == AdapterResultStatus.SUCCESS
         assert dim_result is string_result
@@ -1149,6 +1295,25 @@ class TestCircuitBreakerCoverage:
 
 class TestConnectionPoolAdapterCoverage:
     """Test connection pool adapter coverage."""
+
+    @pytest.mark.asyncio
+    async def test_sheet_metal_io_delegates_to_one_pooled_adapter(self):
+        """Pool wrappers must preserve the real sheet-metal IO operations."""
+        inner = MockSolidWorksAdapter({})
+        info = AdapterResult(status=AdapterResultStatus.SUCCESS, data={"is_sheet_metal": True})
+        flat = AdapterResult(status=AdapterResultStatus.SUCCESS, data={"is_flattened": True})
+        exported = AdapterResult(status=AdapterResultStatus.SUCCESS, data={"path": "flat.dxf"})
+        inner.get_sheet_metal_info = AsyncMock(return_value=info)
+        inner.set_sheet_metal_flat_state = AsyncMock(return_value=flat)
+        inner.export_flat_pattern_dxf = AsyncMock(return_value=exported)
+        pool = ConnectionPoolAdapter(adapter_factory=lambda: inner, pool_size=1)
+
+        assert await pool.get_sheet_metal_info() is info
+        assert await pool.set_sheet_metal_flat_state(True) is flat
+        assert await pool.export_flat_pattern_dxf("flat.dxf", "part.sldprt", 21) is exported
+        inner.set_sheet_metal_flat_state.assert_awaited_once_with(True)
+        inner.export_flat_pattern_dxf.assert_awaited_once_with("flat.dxf", "part.sldprt", 21)
+        await pool.disconnect()
 
     @pytest.mark.asyncio
     async def test_attempt_async_exception_returns_default(self):
@@ -1440,6 +1605,12 @@ class TestConnectionPoolAdapterCoverage:
                     data=SolidWorksFeature(id="f2", name="Fillet1", type="Fillet"),
                 )
             ),
+            add_chamfer=AsyncMock(
+                return_value=AdapterResult(
+                    status=AdapterResultStatus.SUCCESS,
+                    data=SolidWorksFeature(id="f3", name="Chamfer1", type="Chamfer"),
+                )
+            ),
             add_arc=AsyncMock(
                 return_value=AdapterResult(
                     status=AdapterResultStatus.SUCCESS, data="Arc1"
@@ -1484,6 +1655,7 @@ class TestConnectionPoolAdapterCoverage:
 
         cut_result = await pool.create_cut_extrude(extrusion)
         fillet_result = await pool.add_fillet(2.0, ["Edge1"])
+        chamfer_result = await pool.add_chamfer(1.0, ["Edge1"])
         macro_result = await pool.execute_macro({"name": "macro"})
         arc_result = await pool.add_arc(0.0, 0.0, 1.0, 0.0, 0.0, 1.0)
         dim_result = await pool.add_sketch_dimension("Line1", None, "linear", 2.5)
@@ -1493,6 +1665,7 @@ class TestConnectionPoolAdapterCoverage:
 
         assert cut_result.data.name == "Cut1"
         assert fillet_result.data.name == "Fillet1"
+        assert chamfer_result.data.name == "Chamfer1"
         assert macro_result.data["macro"] == "ok"
         assert arc_result.data == "Arc1"
         assert dim_result.data == "Dim1"

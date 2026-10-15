@@ -22,7 +22,7 @@ on:
     - cron: '0 2 * * *'
 
 env:
-  NODE_VERSION: '20.x'
+  PYTHON_VERSION: '3.11'
 
 jobs:
   integration-test:
@@ -34,14 +34,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
+      - name: Setup Python
+        uses: actions/setup-python@v6
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
 
       - name: Install dependencies
-        run: npm ci
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test,ui]"
 
       - name: Verify SolidWorks Installation
         shell: pwsh
@@ -55,15 +57,16 @@ jobs:
           $version = (Get-Item $swPath).VersionInfo.ProductVersion
           Write-Host "SolidWorks version: $version"
 
-      - name: Build
-        run: npm run build
-
       - name: Run Integration Tests
-        run: npm run test:integration
+        run: >
+          python -m pytest tests/solidworks_mcp/test_real_solidworks_integration.py
+          -m "integration and windows_only and solidworks_only"
+          --no-cov -v
         env:
           SOLIDWORKS_VERSION: ${{ github.event.inputs.sw-version || '2024' }}
-          USE_MOCK_SOLIDWORKS: false
-          LOG_LEVEL: debug
+          SOLIDWORKS_MCP_RUN_REAL_INTEGRATION: 'true'
+          SOLIDWORKS_MCP_MOCK_SOLIDWORKS: 'false'
+          SOLIDWORKS_MCP_LOG_LEVEL: DEBUG
 
       - name: Upload Test Results
         if: always()
@@ -71,8 +74,9 @@ jobs:
         with:
           name: integration-test-results-${{ github.event.inputs.sw-version || '2024' }}
           path: |
-            test-results/
-            logs/
+            tests/.generated/solidworks_integration/
+            .solidworks_mcp/artifacts/
+            .solidworks_mcp/logs/
           retention-days: 14
 
       - name: Upload Screenshots (on failure)

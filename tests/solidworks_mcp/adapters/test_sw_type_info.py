@@ -5,6 +5,67 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
+
+
+def test_supported_typelib_versions_include_solidworks_2019() -> None:
+    """SolidWorks 2019 uses type-library major version 27."""
+    from solidworks_mcp.adapters import sw_type_info
+
+    assert sw_type_info.SUPPORTED_TLB_MAJORS[-3:] == (29, 28, 27)
+
+
+def test_flag_methods_skips_legacy_solidworks_dispatch(monkeypatch) -> None:
+    """2019 type information is readable but must not probe every method."""
+    from solidworks_mcp.adapters import sw_type_info
+
+    dispatch = SimpleNamespace(_FlagAsMethod=Mock())
+    monkeypatch.setattr(sw_type_info, "_wrapper_module", object())
+    monkeypatch.setattr(sw_type_info, "_wrapper_major", 27)
+    monkeypatch.setattr(
+        sw_type_info, "_interface_methods", {"IModelDoc2": frozenset({"GetType"})}
+    )
+
+    assert sw_type_info.flag_methods(dispatch, "IModelDoc2") == 0
+    dispatch._FlagAsMethod.assert_not_called()
+
+
+def test_flag_method_marks_one_known_legacy_member(monkeypatch) -> None:
+    """One necessary legacy method can be flagged without an interface scan."""
+    from solidworks_mcp.adapters import sw_type_info
+
+    dispatch = SimpleNamespace(_FlagAsMethod=Mock())
+    monkeypatch.setattr(sw_type_info, "_wrapper_module", object())
+    monkeypatch.setattr(sw_type_info, "_wrapper_major", 27)
+    monkeypatch.setattr(
+        sw_type_info,
+        "_interface_methods",
+        {"IView": frozenset({"GetReferencedModelName"})},
+    )
+
+    assert sw_type_info.flag_method(
+        dispatch, "IView", "GetReferencedModelName"
+    )
+    dispatch._FlagAsMethod.assert_called_once_with("GetReferencedModelName")
+
+
+def test_interface_supports_method_distinguishes_unknown_type_information(
+    monkeypatch,
+) -> None:
+    """Callers can distinguish an unavailable wrapper from a missing member."""
+    from solidworks_mcp.adapters import sw_type_info
+
+    monkeypatch.setattr(sw_type_info, "_wrapper_module", object())
+    monkeypatch.setattr(sw_type_info, "_interface_methods", {})
+    assert sw_type_info.interface_supports_method("IDrawingDoc", "CreateProjectionView") is None
+
+    monkeypatch.setattr(
+        sw_type_info, "_interface_methods", {"IDrawingDoc": frozenset()}
+    )
+    assert (
+        sw_type_info.interface_supports_method("IDrawingDoc", "CreateProjectionView")
+        is False
+    )
 
 
 def test_import_handles_missing_pywin32(monkeypatch) -> None:

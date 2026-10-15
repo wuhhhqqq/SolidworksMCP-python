@@ -339,7 +339,7 @@ To test just the agent CLI smoke tests:
 |---|---|---|
 | `Sketch is still active` | `exit_sketch()` was skipped | Always call `exit_sketch()` before creating a feature |
 | `Plane not found: "front"` | Wrong case | Use `"Front"`, `"Top"`, `"Right"` exactly |
-| `create_loft is not implemented` | Tool not yet available | Use `generate_vba_part_modeling` + `execute_macro` |
+| `SW_SKETCH_NOT_READY` from sweep/loft | A profile, path, or guide was not created and exited in this workflow session | Create and exit every required sketch, then pass only the returned sketch references |
 | Extruded depth looks wrong | Units mismatch | Pass > 0.5 values as mm; server auto-normalises |
 | Assembly mates don't constrain | Wrong entity name | Check entity names via `list_features` on the part |
 

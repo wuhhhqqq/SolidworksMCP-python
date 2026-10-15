@@ -27,7 +27,9 @@ Behavior:
 
 ## Full Test Mode
 
-Run this on Windows with SolidWorks installed and available via COM:
+Run this on Windows with SolidWorks installed. Start SolidWorks first from its
+desktop shortcut and wait until its startup is complete; the MCP test suite
+attaches only to that existing instance and never starts it through COM:
 
 ```bash
 make test-full

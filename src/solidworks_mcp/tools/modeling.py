@@ -367,6 +367,31 @@ class AddFilletInput(CompatInput):
             raise ValueError("radius must be positive")
 
 
+class AddChamferInput(CompatInput):
+    """Legacy equal-distance chamfer input.
+
+    Prefer ``solidworks_create_chamfer`` for new callers. This compatibility
+    input accepts historical SolidWorks names/coordinates, which are less safe
+    than the revision-bound topology IDs used by the typed tool.
+    """
+
+    distance: float = Field(description="Chamfer distance in millimeters")
+    edge_names: list[str] = Field(
+        min_length=1,
+        max_length=100,
+        description=(
+            "One or more SolidWorks edge names or coordinate edge specifications, "
+            "for example 'Edge<1>'."
+        ),
+    )
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.distance <= 0:
+            raise ValueError("distance must be positive")
+        if any(not edge_name.strip() for edge_name in self.edge_names):
+            raise ValueError("edge_names must not contain empty edge references")
+
+
 class CreateAssemblyInput(CompatInput):
     """Input schema for creating a new assembly.
 
@@ -423,7 +448,7 @@ async def register_modeling_tools(
                         print(f"Registered {tool_count} modeling tools")
                         ```
     """
-    tool_count = 0
+    initial_tool_count = len(await mcp.list_tools())
 
     @mcp.tool()
     async def open_model(input_data: OpenModelInput) -> dict[str, Any]:
@@ -723,6 +748,69 @@ async def register_modeling_tools(
             }
 
     @mcp.tool()
+    async def get_selection_state() -> dict[str, Any]:
+        """Read a safe, serializable snapshot of the current SolidWorks selection.
+
+        This read-only tool returns the number of selected objects and, for each
+        object, its selection-manager index, SolidWorks type code, selection mark,
+        optional object name, and optional owning component name. It never returns
+        COM handles and does not alter the active selection. Use it to confirm the
+        current UI state before a workflow that requires an explicitly selected
+        sketch entity, face, edge, component, or drawing object.
+        """
+        try:
+            result = await adapter.get_selection_state()
+            if result.is_success:
+                state = result.data or {}
+                items = state.get("items") if isinstance(state, dict) else None
+                return {
+                    "status": "success",
+                    "message": f"Read {int(state.get('count', 0)) if isinstance(state, dict) else 0} selected object(s)",
+                    "selection": {
+                        "count": int(state.get("count", 0))
+                        if isinstance(state, dict)
+                        else 0,
+                        "truncated": bool(state.get("truncated", False))
+                        if isinstance(state, dict)
+                        else False,
+                        "items": items if isinstance(items, list) else [],
+                    },
+                    "execution_time": result.execution_time,
+                }
+            return {
+                "status": "error",
+                "message": f"Failed to read selection state: {result.error}",
+            }
+        except Exception as e:
+            logger.error(f"Error in get_selection_state tool: {e}")
+            return {
+                "status": "error",
+                "message": f"Unexpected error: {str(e)}",
+            }
+
+    @mcp.tool()
+    async def list_open_models() -> dict[str, Any]:
+        """List documents open in the connected SolidWorks instance without activating any."""
+        try:
+            result = await adapter.list_open_models()
+            if result.is_success:
+                models = result.data if isinstance(result.data, list) else []
+                return {
+                    "status": "success",
+                    "message": f"Found {len(models)} open model(s)",
+                    "models": models,
+                    "count": len(models),
+                    "execution_time": result.execution_time,
+                }
+            return {
+                "status": "error",
+                "message": f"Failed to list open models: {result.error}",
+            }
+        except Exception as e:
+            logger.error(f"Error in list_open_models tool: {e}")
+            return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+
+    @mcp.tool()
     async def create_extrusion(input_data: CreateExtrusionInput) -> dict[str, Any]:
         """Create an extrusion feature from the active sketch.
 
@@ -997,11 +1085,14 @@ async def register_modeling_tools(
 
     @mcp.tool()
     async def create_cut_extrude(input_data: CreateCutExtrudeInput) -> dict[str, Any]:
-        """Cut material from the active model using the current sketch profile.
+        """Legacy cut-extrude tool; prefer ``solidworks_create_cut_extrude`` for new workflows.
 
-        Creates a Cut-Extrude feature (Insert > Cut > Extrude) from the active sketch.
-        Use this after exit_sketch when you want to remove material — e.g. to create
-        windows, holes, slots, or any through/blind cut in an existing solid body.
+        Creates a Cut-Extrude feature (Insert > Cut > Extrude) from the most recently
+        tracked sketch.  Use this after ``exit_sketch`` when compatibility with the
+        original API is required.  New clients should use the session workflow
+        ``solidworks_create_cut_extrude`` because it carries an explicit
+        ``session_id``, ``document_id`` and ``sketch_id`` and cannot accidentally
+        consume an unrelated sketch.
 
         Args:
             input_data (CreateCutExtrudeInput): Depth, direction and draft parameters.
@@ -1049,7 +1140,14 @@ async def register_modeling_tools(
             else:
                 return {
                     "status": "error",
-                    "message": f"Failed to create cut-extrude: {result.error}",
+                    "message": (
+                        f"Failed to create cut-extrude: {result.error}. "
+                        "For a session workflow, retry with "
+                        "solidworks_create_cut_extrude and pass the active "
+                        "session_id, document_id, and sketch_id; do not retry "
+                        "this legacy tool blindly because the cut may already "
+                        "exist in SolidWorks."
+                    ),
                 }
         except Exception as e:
             logger.error(f"Error in create_cut_extrude tool: {e}")
@@ -1100,6 +1198,50 @@ async def register_modeling_tools(
         except Exception as e:
             logger.error(f"Error in add_fillet tool: {e}")
             return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+
+    @mcp.tool()
+    async def add_chamfer(input_data: AddChamferInput) -> dict[str, Any]:
+        """Legacy chamfer using named/coordinate edges; prefer solidworks_create_chamfer.
+
+        Args:
+            input_data: Chamfer distance in millimetres and at least one edge reference.
+
+        Returns:
+            A status envelope containing the created chamfer name and requested geometry.
+        """
+        try:
+            input_data = _normalize_input(input_data, AddChamferInput)
+            result = await adapter.add_chamfer(
+                input_data.distance, input_data.edge_names
+            )
+            if result.is_success:
+                feature = result.data
+                return {
+                    "status": "success",
+                    "message": (
+                        "Created chamfer: "
+                        f"{_result_value(feature, 'feature_name', 'name', default='Chamfer')}"
+                    ),
+                    "chamfer": {
+                        "name": _result_value(
+                            feature, "feature_name", "name", default="Chamfer"
+                        ),
+                        "distance": input_data.distance,
+                        "edges": input_data.edge_names,
+                    },
+                    "hint": (
+                        "For new calls, list current part topology and use "
+                        "solidworks_create_chamfer with opaque edge_ids."
+                    ),
+                    "execution_time": result.execution_time,
+                }
+            return {
+                "status": "error",
+                "message": f"Failed to add chamfer: {result.error}",
+            }
+        except Exception as exc:
+            logger.error(f"Error in add_chamfer tool: {exc}")
+            return {"status": "error", "message": f"Unexpected error: {exc}"}
 
     @mcp.tool()
     async def create_sweep(input_data: CreateSweepInput) -> dict[str, Any]:
@@ -1224,5 +1366,4 @@ async def register_modeling_tools(
             logger.error(f"Error in create_loft tool: {e}")
             return {"status": "error", "message": f"Unexpected error: {str(e)}"}
 
-    tool_count = 12  # Number of tools registered
-    return tool_count
+    return len(await mcp.list_tools()) - initial_tool_count

@@ -7,9 +7,14 @@ SolidWorks automation capabilities on Windows platforms.
 import asyncio
 import os
 import platform
+import re
+import subprocess
+import tempfile
+import threading
 import time
 from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypeVar
 
@@ -21,6 +26,9 @@ from .base import (
     AdapterResultStatus,
     SolidWorksAdapter,
 )
+from .dxf_caxa import CAXA_2015_PROFILE, normalize_for_caxa_2015
+from .process_lease import AUTOMATION_PROCESS_LEASE
+from .windows_runtime import running_solidworks_process_ids
 from .solidworks import (
     SolidWorksFeaturesMixin,
     SolidWorksIOMixin,
@@ -61,6 +69,214 @@ def _dynamic_dispatch(arg: Any) -> Any:
 from loguru import logger  # noqa: E402
 
 T = TypeVar("T")
+# SolidWorks exposes one desktop-wide document state.  Multiple adapter
+# instances are created by the dashboard preview/checkpoint services, so an
+# instance-local lock does not protect NewPart/OpenDoc6 across those callers.
+# Keep the lock process-wide; the individual adapter points at this same lock.
+_GLOBAL_COM_OPERATION_LOCK = threading.RLock()
+# Documents created/opened by any adapter in this MCP process. Preview and
+# checkpoint services use short-lived adapters, so per-instance ownership is
+# insufficient for shutdown cleanup.
+_GLOBAL_SESSION_DOCUMENTS: list[tuple[Any, Any]] = []
+_VB_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _same_com_reference(left: Any, right: Any) -> bool:
+    """Compare COM wrappers without allowing comparison errors to escape."""
+    if left is right:
+        return True
+    try:
+        return bool(left == right)
+    except Exception:
+        return False
+
+
+def _config_value(config: Any, name: str, default: Any = None) -> Any:
+    """Read a launch setting from either an adapter mapping or config model."""
+    if isinstance(config, dict):
+        return config.get(name, default)
+    return getattr(config, name, default)
+
+
+def _solidworks_executable_candidates(config: Any) -> list[Path]:
+    """Return deterministic executable candidates for installed SolidWorks releases."""
+    configured = _config_value(config, "solidworks_path")
+    year = _config_value(config, "solidworks_year")
+    candidates: list[Path] = []
+
+    if configured:
+        configured_path = Path(str(configured)).expanduser()
+        if configured_path.suffix.lower() == ".exe":
+            candidates.append(configured_path)
+        else:
+            candidates.append(configured_path / "SLDWORKS.exe")
+
+    program_roots = [
+        os.environ.get("ProgramW6432"),
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramFiles(x86)"),
+    ]
+    for root in program_roots:
+        if not root:
+            continue
+        base = Path(root) / "SOLIDWORKS Corp"
+        if year:
+            candidates.extend(
+                [
+                    base / f"SOLIDWORKS {year}" / "SLDWORKS.exe",
+                    base / f"SOLIDWORKS {year}" / "SLDWORKS" / "SLDWORKS.exe",
+                ]
+            )
+        candidates.append(base / "SOLIDWORKS" / "SLDWORKS.exe")
+        try:
+            candidates.extend(sorted(base.glob("SOLIDWORKS*/SLDWORKS.exe")))
+        except OSError:
+            pass
+
+    # SolidWorks records the installation directory in one of several registry
+    # locations depending on release and 32/64-bit installation mode.
+    if platform.system() == "Windows":
+        try:
+            import winreg
+
+            key_names = []
+            if year:
+                key_names.append(f"SOFTWARE\\SolidWorks\\SolidWorks {year}\\Setup")
+            key_names.extend(
+                [
+                    "SOFTWARE\\SolidWorks\\Applications\\SLDWORKS",
+                    "SOFTWARE\\SolidWorks\\Setup",
+                ]
+            )
+            value_names = ("SolidWorksLocation", "InstallDir", "ApplicationPath", "Path")
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for key_name in key_names:
+                    for access in (
+                        winreg.KEY_READ,
+                        getattr(winreg, "KEY_WOW64_32KEY", 0) | winreg.KEY_READ,
+                    ):
+                        try:
+                            with winreg.OpenKey(hive, key_name, 0, access) as key:
+                                for value_name in value_names:
+                                    try:
+                                        value, _ = winreg.QueryValueEx(key, value_name)
+                                    except OSError:
+                                        continue
+                                    if value:
+                                        value_path = Path(str(value))
+                                        candidates.append(
+                                            value_path
+                                            if value_path.suffix.lower() == ".exe"
+                                            else value_path / "SLDWORKS.exe"
+                                        )
+                        except OSError:
+                            continue
+        except ImportError:  # pragma: no cover - non-Windows test environments
+            pass
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def _solidworks_shortcut_candidates(config: Any) -> list[Path]:
+    """Find user-facing SolidWorks shortcuts, preferring the configured release."""
+    year = _config_value(config, "solidworks_year")
+    roots = [
+        Path.home() / "Desktop",
+        Path(os.environ.get("PUBLIC", r"C:\Users\Public")) / "Desktop",
+        Path(os.environ.get("ProgramData", r"C:\ProgramData"))
+        / "Microsoft"
+        / "Windows"
+        / "Start Menu"
+        / "Programs",
+    ]
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        roots.insert(
+            2,
+            Path(appdata)
+            / "Microsoft"
+            / "Windows"
+            / "Start Menu"
+            / "Programs",
+        )
+    matches: list[Path] = []
+    for root in roots:
+        if not root or not root.exists():
+            continue
+        try:
+            for shortcut in root.rglob("*.lnk"):
+                lowered = shortcut.stem.lower()
+                if "solidworks" not in lowered:
+                    continue
+                matches.append(shortcut)
+        except OSError:
+            continue
+    matches.sort(
+        key=lambda path: (
+            0 if year and str(year) in path.stem else 1,
+            0 if "solidworks" == path.stem.lower() else 1,
+            str(path).lower(),
+        )
+    )
+    return matches
+
+
+def resolve_solidworks_launcher(config: Any) -> tuple[str, Path] | None:
+    """Resolve an installed SolidWorks executable or desktop shortcut.
+
+    Returns ``("executable", path)`` or ``("shortcut", path)``.  Only existing
+    paths are returned, so a launch request never silently falls back to an
+    unrelated command on ``PATH``.
+    """
+    configured = _config_value(config, "solidworks_path")
+    executable_candidates = _solidworks_executable_candidates(config)
+    if configured:
+        path = Path(str(configured)).expanduser()
+        if path.is_dir():
+            path = path / "SLDWORKS.exe"
+        if path.is_file() and path.name.lower() == "sldworks.exe":
+            return "executable", path
+        if path.is_file() and path.suffix.lower() == ".lnk" and _is_solidworks_shortcut(path):
+            return "shortcut", path
+        raise SolidWorksMCPError("Configured SolidWorks path is invalid; specify SLDWORKS.exe or a verified shortcut")
+
+    # Prefer the same user-facing shortcut that avoids the COM Dispatch
+    # startup path and its release-specific first-run dialogs.
+    for path in _solidworks_shortcut_candidates(config):
+        if path.is_file() and _is_solidworks_shortcut(path):
+            return "shortcut", path
+    for path in executable_candidates:
+        if path.is_file() and path.name.lower() == "sldworks.exe":
+            return "executable", path
+    return None
+
+
+def _is_solidworks_shortcut(path: Path) -> bool:
+    """Reject similarly named license managers, viewers, and other utilities."""
+    try:
+        shell = win32com.client.Dispatch("WScript.Shell")
+        shortcut = shell.CreateShortcut(str(path))
+        target = Path(os.path.expandvars(str(shortcut.TargetPath)))
+        return target.name.lower() == "sldworks.exe" and target.is_file()
+    except Exception:
+        return False
+# swUserPreferenceToggle_e.swDxfExportAllSheetsToPaperSpace. This setting
+# governs both DWG and DXF exports generated from SolidWorks drawings.
+_SW_DXF_EXPORT_ALL_SHEETS_TO_PAPER_SPACE = 484
+_SW_DXF_MAPPING = 8
+_SW_DXF_USE_SOLIDWORKS_LAYERS = 305
+_SW_DXF_ENDPOINT_MERGE = 316
+_SW_DXF_EXPORT_SPLINES_AS_SPLINES = 358
+_SW_DXF_HIGH_QUALITY_EXPORT = 400
+_SW_DXF_VERSION = 0
+_SW_DXF_VERSION_R12 = 0
 
 
 def _parse_vb_module_name(macro_path: str) -> str:
@@ -148,22 +364,23 @@ class _ComSessionCoordinator:
         self._adapter._com_initialized = False
 
     async def acquire_solidworks_application(self) -> Any:
-        """Acquire a live SolidWorks COM application object with retries.
+        """Attach to a manually started SolidWorks COM application with retries.
 
-        Attempts up to 8 connect-cycles.  Each cycle first tries
-        ``win32com.client.GetActiveObject("SldWorks.Application")`` to bind to
-        a running instance, then falls back to
-        ``win32com.client.Dispatch("SldWorks.Application")`` to start one.
-        Between cycles the coroutine sleeps 1 second so that a slow
-        SolidWorks launch has time to register its COM class.
+        Attempts up to 8 attach-cycles through
+        ``win32com.client.GetActiveObject("SldWorks.Application")`` only.
+        The adapter deliberately never calls ``Dispatch`` with the SolidWorks
+        ProgID: COM activation starts SolidWorks differently from the desktop
+        shortcut and can cause startup dialogs.  Between cycles the coroutine
+        sleeps 1 second so a manually launched SolidWorks instance has time to
+        register its COM class.
 
         Returns:
             Any: The live ``SldWorks.Application`` COM object.
 
         Raises:
-            SolidWorksMCPError: After all retries are exhausted, wraps the
-                last ``pywintypes.com_error`` or raises a generic message
-                when the returned object is ``None``.
+            SolidWorksMCPError: After all retries are exhausted, tells the
+                caller to start SolidWorks from its desktop shortcut and wait
+                for it to finish loading.
 
         Side Effects:
             Sets ``adapter.swApp`` to the acquired COM object.
@@ -180,22 +397,130 @@ class _ComSessionCoordinator:
                 if app is not None:
                     self._adapter.swApp = app
                     return app
-            except pywintypes.com_error as active_error:
+            except Exception as active_error:
                 last_error = active_error
-
-            try:
-                app = _dynamic_dispatch("SldWorks.Application")
-                if app is not None:
-                    self._adapter.swApp = app
-                    return app
-            except pywintypes.com_error as dispatch_error:
-                last_error = dispatch_error
 
             await asyncio.sleep(1.0)
 
-        if last_error is not None:
-            raise SolidWorksMCPError(str(last_error))
-        raise SolidWorksMCPError("SolidWorks COM application instance is None")
+        detail = f" Last COM error: {last_error}" if last_error is not None else ""
+        raise SolidWorksMCPError(
+            "No running SolidWorks instance was found. Start SolidWorks from "
+            "the desktop shortcut, wait until it is fully ready, then retry."
+            f"{detail}"
+        )
+
+    def _try_acquire_active_application(self) -> Any | None:
+        """Return an active SolidWorks COM object without starting a process."""
+        try:
+            raw = win32com.client.GetActiveObject("SldWorks.Application")
+            return _dynamic_dispatch(raw) if raw is not None else None
+        except Exception:
+            return None
+
+    async def _prepare_connected_application(self, app: Any) -> None:
+        """Apply the common readiness and automation setup after COM acquisition."""
+        self._adapter.swApp = app
+        self._adapter._attempt(
+            lambda: sw_type_info.flag_methods(app, "ISldWorks"), default=0
+        )
+        await self.wait_for_server_ready(app)
+        app.Visible = True
+        self.set_automation_preferences(app, interactive=False)
+
+    async def start_solidworks(self, timeout_seconds: float | None = None) -> dict[str, Any]:
+        """Explicitly launch SolidWorks and attach to its COM server.
+
+        This method is only called by the panel's explicit start action.  It
+        first checks ``GetActiveObject`` to avoid duplicate instances, then
+        launches a configured/installed executable or a SolidWorks desktop
+        shortcut and waits for COM registration.  It never uses COM
+        ``Dispatch`` and never owns the SolidWorks process for shutdown.
+        """
+        try:
+            self.initialize_com_apartment()
+            active = self._try_acquire_active_application()
+            if active is not None:
+                await self._prepare_connected_application(active)
+                return {
+                    "started": False,
+                    "already_running": True,
+                    "connected": True,
+                    "launcher": None,
+                    "pid": None,
+                }
+
+            existing_pids = running_solidworks_process_ids()
+            previous_process = self._adapter._launched_process
+            if previous_process is not None and previous_process.poll() is None:
+                existing_pids = tuple(set(existing_pids) | {previous_process.pid})
+            launcher = None if existing_pids else resolve_solidworks_launcher(self._adapter.config_dict)
+            if launcher is None and not existing_pids:
+                raise SolidWorksMCPError(
+                    "无法定位 SolidWorks。请在 SOLIDWORKS_MCP_SOLIDWORKS_PATH "
+                    "中设置 SLDWORKS.exe 路径，或确认桌面/开始菜单存在 SolidWorks 快捷方式。"
+                )
+
+            launch_kind, launch_path = launcher if launcher is not None else (None, None)
+            process: subprocess.Popen[Any] | None = None
+            if launch_kind == "executable":
+                creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                creation_flags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+                process = subprocess.Popen(
+                    [str(launch_path)],
+                    cwd=str(launch_path.parent),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=creation_flags,
+                )
+                # Retain the process before waiting: timeout must not lose the
+                # only evidence of an application that is still starting.
+                self._adapter._launched_process = process
+            elif launch_kind == "shortcut":
+                os.startfile(str(launch_path))  # type: ignore[attr-defined]
+
+            timeout_raw = timeout_seconds if timeout_seconds is not None else self._adapter.config_dict.get(
+                "solidworks_startup_timeout_seconds",
+                self._adapter.config_dict.get("startup_timeout", 60),
+            )
+            try:
+                timeout = max(5.0, min(float(timeout_raw), 300.0))
+            except (TypeError, ValueError):
+                timeout = 60.0
+            deadline = time.monotonic() + timeout
+            app = None
+            while time.monotonic() < deadline:
+                app = self._try_acquire_active_application()
+                if app is not None:
+                    break
+                await asyncio.sleep(0.5)
+            if app is None:
+                state = "exited" if process is not None and process.poll() is not None else "not registered"
+                raise SolidWorksMCPError(
+                    f"SolidWorks 启动后在 {timeout:g} 秒内未注册 COM（进程状态: {state}）。"
+                    "已有进程时不会重复启动。请确认启动对话框已完成，"
+                    "或检查 SolidWorks 与 MCP 是否在同一桌面会话和权限级别运行。"
+                )
+
+            await self._prepare_connected_application(app)
+            if process is not None:
+                self._adapter._launched_process = process
+            return {
+                "started": not bool(existing_pids),
+                "already_running": bool(existing_pids),
+                "connected": True,
+                "launcher": str(launch_path) if launch_path is not None else None,
+                "launcher_type": launch_kind,
+                "pid": process.pid if process is not None else (existing_pids[0] if existing_pids else None),
+            }
+        except BaseException as exc:
+            self._adapter.swApp = None
+            self.uninitialize_com_apartment()
+            if not isinstance(exc, Exception):
+                raise
+            if isinstance(exc, SolidWorksMCPError):
+                raise
+            raise SolidWorksMCPError(f"启动 SolidWorks 失败: {exc}") from exc
 
     async def wait_for_server_ready(self, app: Any) -> None:
         """Poll until the SolidWorks COM server is responsive.
@@ -274,7 +599,8 @@ class _ComSessionCoordinator:
         Performs in order:
 
         1. Initialise the COM apartment.
-        2. Acquire the ``SldWorks.Application`` COM object (with retries).
+        2. Attach to an already-running ``SldWorks.Application`` COM object
+           (with retries).
         3. Wait for the server to become ready.
         4. Make the application window visible.
         5. Suppress interactive dialogs for automation.
@@ -288,15 +614,12 @@ class _ComSessionCoordinator:
         try:
             self.initialize_com_apartment()
             app = await self.acquire_solidworks_application()
-            self._adapter._attempt(
-                lambda: sw_type_info.flag_methods(app, "ISldWorks"), default=0
-            )
-            await self.wait_for_server_ready(app)
-            app.Visible = True
-            self.set_automation_preferences(app, interactive=False)
-        except Exception as exc:
+            await self._prepare_connected_application(app)
+        except BaseException as exc:
             self._adapter.swApp = None
             self.uninitialize_com_apartment()
+            if not isinstance(exc, Exception):
+                raise
             raise SolidWorksMCPError(f"Failed to connect to SolidWorks: {exc}") from exc
 
     async def disconnect(self) -> None:
@@ -1394,6 +1717,15 @@ class PyWin32Adapter(
         self.currentModel: Any | None = None
         self.currentSketch: Any | None = None
         self.currentSketchManager: Any | None = None
+        # Only documents created or opened through this adapter instance. This
+        # enables integration tests to clean up precisely without touching
+        # documents that were already open in the user's SolidWorks session.
+        self._session_owned_documents: list[Any] = []
+        # SolidWorks exposes one desktop-wide COM document state.  FastMCP may
+        # dispatch independent tool calls concurrently, so serialize each
+        # synchronous COM operation to prevent interleaved NewPart/OpenDoc6
+        # calls from creating duplicate documents.
+        self._com_operation_lock = _GLOBAL_COM_OPERATION_LOCK
         self._last_sketch_name: str | None = None
         self._sketch_count: int = 0  # incremented each time a sketch is created
         self._sketch_entities: dict[str, Any] = {}
@@ -1405,6 +1737,9 @@ class PyWin32Adapter(
         self._sketch_entity_centers: dict[str, tuple[float, float]] = {}
         self._sketch_entity_counter = 0
         self._com_initialized = False
+        # Informational handle only.  The MCP never terminates this process;
+        # keeping it lets the explicit launch response report its PID/state.
+        self._launched_process: subprocess.Popen[Any] | None = None
 
         # COM constants (equivalent to SolidWorks API constants)
         self.constants = {
@@ -1497,7 +1832,21 @@ class PyWin32Adapter(
         Raises:
             SolidWorksMCPError: If connection or readiness checks fail.
         """
-        await self._session_coordinator.connect()
+        AUTOMATION_PROCESS_LEASE.acquire(self)
+        try:
+            await self._session_coordinator.connect()
+        except BaseException:
+            AUTOMATION_PROCESS_LEASE.release(self)
+            raise
+
+    async def start_solidworks(self, timeout_seconds: float | None = None) -> dict[str, Any]:
+        """Explicitly start SolidWorks from the panel and attach to COM."""
+        AUTOMATION_PROCESS_LEASE.acquire(self)
+        try:
+            return await self._session_coordinator.start_solidworks(timeout_seconds)
+        except BaseException:
+            AUTOMATION_PROCESS_LEASE.release(self)
+            raise
 
     async def disconnect(self) -> None:
         """Disconnect from SolidWorks application.
@@ -1520,7 +1869,159 @@ class PyWin32Adapter(
                                 await adapter.disconnect()
                             ```
         """
-        await self._session_coordinator.disconnect()
+        try:
+            await self._session_coordinator.disconnect()
+        finally:
+            AUTOMATION_PROCESS_LEASE.release(self)
+
+    def _track_session_document(self, document: Any) -> None:
+        """Record a document created or opened through this adapter instance."""
+        if document is None:
+            return
+        owned_documents = getattr(self, "_session_owned_documents", None)
+        if not isinstance(owned_documents, list):
+            owned_documents = []
+            self._session_owned_documents = owned_documents
+        if not any(existing is document for existing in owned_documents):
+            owned_documents.append(document)
+        app = getattr(self, "swApp", None)
+        if app is not None and not any(
+            _same_com_reference(existing_app, app) and existing_document is document
+            for existing_app, existing_document in _GLOBAL_SESSION_DOCUMENTS
+        ):
+            _GLOBAL_SESSION_DOCUMENTS.append((app, document))
+
+    def _untrack_session_document(self, document: Any) -> None:
+        """Remove one explicitly closed document from session cleanup tracking."""
+        owned_documents = getattr(self, "_session_owned_documents", None)
+        if not isinstance(owned_documents, list):
+            return
+        self._session_owned_documents = [
+            existing for existing in owned_documents if existing is not document
+        ]
+        _GLOBAL_SESSION_DOCUMENTS[:] = [
+            (existing_app, existing_document)
+            for existing_app, existing_document in _GLOBAL_SESSION_DOCUMENTS
+            if existing_document is not document
+        ]
+
+    async def close_all_session_docs(self) -> AdapterResult[None]:
+        """Close only documents created or opened through this adapter session.
+
+        The current COM title is read immediately before close because a document
+        can change its title after a native ``Save As`` operation.
+        """
+        if self.swApp is None:
+            return AdapterResult(
+                status=AdapterResultStatus.WARNING,
+                error="SolidWorks application is not connected",
+            )
+
+        def _close_all() -> None:
+            app = self.swApp
+            if app is None:
+                raise RuntimeError("SolidWorks application is not connected")
+            get_documents = getattr(app, "GetDocuments", None)
+            enumeration_sentinel = object()
+            raw_documents = (
+                self._attempt(
+                    lambda: self._get_attr_or_call(app, "GetDocuments"),
+                    default=enumeration_sentinel,
+                )
+                if get_documents is not None
+                else None
+            )
+            # A title-only CloseDoc is unsafe when SolidWorks cannot enumerate
+            # the current documents. This also covers older/limited COM
+            # proxies that do not expose GetDocuments at all.
+            enumeration_failed = get_documents is None or (
+                raw_documents is enumeration_sentinel or raw_documents is None
+            )
+            current_documents: list[Any] | None = None
+            if raw_documents is not None and not enumeration_failed:
+                if isinstance(raw_documents, (list, tuple)):
+                    current_documents = [
+                        document for document in raw_documents if document is not None
+                    ]
+                else:
+                    try:
+                        current_documents = [
+                            document
+                            for document in raw_documents
+                            if document is not None
+                        ]
+                    except TypeError:
+                        current_documents = [raw_documents]
+
+            def _same_document(left: Any, right: Any) -> bool:
+                if left is right:
+                    return True
+                try:
+                    return bool(left == right)
+                except Exception:
+                    return False
+
+            owned_documents = list(
+                reversed(getattr(self, "_session_owned_documents", []))
+            )
+            for existing_app, existing_document in reversed(_GLOBAL_SESSION_DOCUMENTS):
+                if _same_com_reference(existing_app, app) and not any(
+                    owned is existing_document for owned in owned_documents
+                ):
+                    owned_documents.append(existing_document)
+            remaining_documents: list[Any] = []
+            for document in owned_documents:
+                # If the original wrapper is no longer present, the user may
+                # have closed it and opened another document with the same
+                # title/path. Never close that replacement document.
+                document_to_close = document
+                if current_documents is not None:
+                    document_to_close = next(
+                        (
+                            current
+                            for current in current_documents
+                            if _same_document(current, document)
+                        ),
+                        None,
+                    )
+                    if document_to_close is None:
+                        continue
+                elif enumeration_failed:
+                    remaining_documents.append(document)
+                    continue
+                try:
+                    title = self._get_attr_or_call(document_to_close, "GetTitle")
+                except Exception:
+                    title = None
+                if not isinstance(title, str) or not title:
+                    remaining_documents.append(document)
+                    continue
+                try:
+                    app.CloseDoc(title)
+                except Exception:
+                    remaining_documents.append(document)
+                else:
+                    try:
+                        from .solidworks.io import _OPEN_DOCUMENT_CACHE  # noqa: PLC0415
+
+                        document_path = self._get_attr_or_call(
+                            document_to_close, "GetPathName"
+                        )
+                        if isinstance(document_path, str) and document_path:
+                            _OPEN_DOCUMENT_CACHE.pop(
+                                os.path.normcase(os.path.abspath(document_path)), None
+                            )
+                    except Exception:
+                        pass
+                    self._untrack_session_document(document)
+            self._session_owned_documents = list(reversed(remaining_documents))
+            if remaining_documents:
+                raise RuntimeError("SolidWorks could not close all session documents")
+            self.currentModel = None
+            self.currentSketch = None
+            self.currentSketchManager = None
+
+        return self._handle_com_operation("close_all_session_docs", _close_all)
 
     def is_connected(self) -> bool:
         """Check if connected to SolidWorks.
@@ -1616,8 +2117,25 @@ class PyWin32Adapter(
                                 print("Sketch created successfully")
                             ```
         """
-        start_time = time.time()
+        lock = getattr(self, "_com_operation_lock", None)
+        if lock is None:
+            return self._handle_com_operation_unlocked(
+                operation_name, operation_func, *operation_args, **operation_kwargs
+            )
+        with lock:
+            return self._handle_com_operation_unlocked(
+                operation_name, operation_func, *operation_args, **operation_kwargs
+            )
 
+    def _handle_com_operation_unlocked(
+        self,
+        operation_name: str,
+        operation_func: Callable[..., T],
+        *operation_args: Any,
+        **operation_kwargs: Any,
+    ) -> AdapterResult[T]:
+        """Execute one COM operation after the caller acquired the desktop lock."""
+        start_time = time.time()
         try:
             result = operation_func(*operation_args, **operation_kwargs)
             execution_time = time.time() - start_time
@@ -2189,6 +2707,136 @@ class PyWin32Adapter(
 
         return self._handle_com_operation("export_file", _export_operation)
 
+    async def export_drawing_cad(
+        self,
+        file_path: str,
+        format_type: str,
+        model_space: bool = True,
+        compatibility_profile: str = "standard",
+    ) -> AdapterResult[dict[str, Any] | None]:
+        """Export the active drawing to DWG or DXF with an explicit space mode.
+
+        SolidWorks controls DWG/DXF drawing placement through an application
+        preference rather than a SaveAs argument. The preference is restored
+        after every export so this MCP operation does not change the user's
+        interactive SolidWorks settings.
+        """
+        if not self.currentModel:
+            return AdapterResult(
+                status=AdapterResultStatus.ERROR, error="No active SolidWorks document"
+            )
+        normalized_format = format_type.lower()
+        if normalized_format not in {"dwg", "dxf"}:
+            return AdapterResult(
+                status=AdapterResultStatus.ERROR,
+                error="Drawing CAD export format must be DWG or DXF",
+            )
+        if compatibility_profile not in {"standard", CAXA_2015_PROFILE}:
+            return AdapterResult(
+                status=AdapterResultStatus.ERROR,
+                error=f"Unsupported CAD compatibility profile: {compatibility_profile}",
+            )
+        if compatibility_profile == CAXA_2015_PROFILE and (
+            normalized_format != "dxf" or not model_space
+        ):
+            return AdapterResult(
+                status=AdapterResultStatus.ERROR,
+                error="CAXA 2015 export requires a model-space DXF",
+            )
+
+        def _export_operation() -> dict[str, Any] | None:
+            target_doc = (
+                getattr(self.swApp, "ActiveDoc", None) if self.swApp else None
+            ) or self.currentModel
+            get_type = getattr(target_doc, "GetType", None)
+            document_type = get_type() if callable(get_type) else get_type
+            if document_type != 3:
+                raise RuntimeError("DWG/DXF model-space export requires an active drawing")
+
+            resolved_path = os.path.abspath(file_path)
+            if os.path.splitext(resolved_path)[1].lower() != f".{normalized_format}":
+                raise RuntimeError(
+                    f"DWG/DXF output path must use the .{normalized_format} extension"
+                )
+            os.makedirs(os.path.dirname(resolved_path), exist_ok=True)
+            if os.path.exists(resolved_path):
+                raise FileExistsError(
+                    f"Refusing to overwrite existing CAD export: {resolved_path}"
+                )
+
+            app = self.swApp
+            get_preference = getattr(app, "GetUserPreferenceToggle", None)
+            set_preference = getattr(app, "SetUserPreferenceToggle", None)
+            if not callable(get_preference) or not callable(set_preference):
+                raise RuntimeError(
+                    "SolidWorks does not expose the DWG/DXF paper-space preference"
+                )
+            toggle_preferences = {
+                _SW_DXF_EXPORT_ALL_SHEETS_TO_PAPER_SPACE: not model_space,
+            }
+            get_integer_preference = getattr(app, "GetUserPreferenceIntegerValue", None)
+            set_integer_preference = getattr(app, "SetUserPreferenceIntegerValue", None)
+            previous_toggles = {
+                key: bool(get_preference(key)) for key in toggle_preferences
+            }
+            previous_dxf_version: int | None = None
+            raw_export_path: str | None = None
+            try:
+                if compatibility_profile == CAXA_2015_PROFILE:
+                    if not callable(get_integer_preference) or not callable(
+                        set_integer_preference
+                    ):
+                        raise RuntimeError(
+                            "SolidWorks does not expose the DXF version preference"
+                        )
+                    previous_dxf_version = int(get_integer_preference(_SW_DXF_VERSION))
+                    toggle_preferences.update(
+                        {
+                            _SW_DXF_MAPPING: False,
+                            _SW_DXF_USE_SOLIDWORKS_LAYERS: False,
+                            _SW_DXF_ENDPOINT_MERGE: True,
+                            _SW_DXF_EXPORT_SPLINES_AS_SPLINES: False,
+                            _SW_DXF_HIGH_QUALITY_EXPORT: False,
+                        }
+                    )
+                    previous_toggles.update(
+                        {
+                            key: bool(get_preference(key))
+                            for key in toggle_preferences
+                            if key not in previous_toggles
+                        }
+                    )
+                    temp_file = tempfile.NamedTemporaryFile(
+                        prefix=".solidworks_caxa_", suffix=".dxf",
+                        dir=os.path.dirname(resolved_path),
+                        delete=False,
+                    )
+                    raw_export_path = temp_file.name
+                    temp_file.close()
+                    os.unlink(raw_export_path)
+                    set_integer_preference(_SW_DXF_VERSION, _SW_DXF_VERSION_R12)
+
+                for preference, value in toggle_preferences.items():
+                    set_preference(preference, value)
+                save_path = raw_export_path or resolved_path
+                success = target_doc.SaveAs3(save_path, 0, 2)
+                if not success and not os.path.exists(save_path):
+                    raise RuntimeError(
+                        f"SolidWorks did not create the {normalized_format.upper()} export"
+                    )
+                if compatibility_profile == CAXA_2015_PROFILE:
+                    return normalize_for_caxa_2015(save_path, resolved_path)
+                return None
+            finally:
+                for preference, value in previous_toggles.items():
+                    set_preference(preference, value)
+                if previous_dxf_version is not None and callable(set_integer_preference):
+                    set_integer_preference(_SW_DXF_VERSION, previous_dxf_version)
+                if raw_export_path and os.path.exists(raw_export_path):
+                    os.unlink(raw_export_path)
+
+        return self._handle_com_operation("export_drawing_cad", _export_operation)
+
     def _get_document_type(self) -> str:
         """Helper method to get document type.
 
@@ -2267,8 +2915,14 @@ class PyWin32Adapter(
             Raises:
                 SolidWorksMCPError: If the operation cannot be completed.
             """
-            module_name = _parse_vb_module_name(macro_path)
-            proc_name = params.get("proc_name", "main")
+            module_name = str(
+                params.get("module_name") or _parse_vb_module_name(macro_path)
+            )
+            proc_name = str(params.get("proc_name", "main"))
+            if _VB_IDENTIFIER.fullmatch(module_name) is None:
+                raise SolidWorksMCPError("Invalid VBA module name")
+            if _VB_IDENTIFIER.fullmatch(proc_name) is None:
+                raise SolidWorksMCPError("Invalid VBA procedure name")
             return self._invoke_run_macro2(macro_path, module_name, proc_name)
 
         return self._handle_com_operation("execute_macro", _run)

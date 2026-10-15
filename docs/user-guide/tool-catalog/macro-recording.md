@@ -2,7 +2,11 @@
 
 Record, replay, analyse, and optimise SolidWorks VBA macros. Create macro libraries for reuse, batch-execute recorded macros, and profile performance hot-spots. Ideal for capturing manual workflows and converting them to automated, repeatable sequences.
 
-> **Prerequisite:** SolidWorks running. Macro execution requires a valid .swp file path.
+> **Security notice:** This is a legacy catalog. Direct path-based `execute_macro`
+> and batch execution are not the supported production API. For a reviewed `.swp`,
+> use `solidworks_list_trusted_macros` → `solidworks_prepare_trusted_macro` →
+> `solidworks_execute_trusted_macro` from the Typed MVP Workflow. That flow only
+> accepts administrator-provisioned manifests and requires a hash confirmation.
 
 **Total tools in this category: 7**
 
@@ -56,7 +60,9 @@ Stop macro recording and save the recorded macro.
 
 ### `execute_macro`
 
-Execute a saved SolidWorks macro.
+Legacy compatibility tool for executing a saved SolidWorks macro. Do not use it
+for new MCP workflows; it accepts a caller-supplied path and does not provide
+the trusted-manifest or hash-confirmation controls of the typed macro tools.
 
 **Prerequisite:** SolidWorks running
 

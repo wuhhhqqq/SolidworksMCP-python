@@ -14,11 +14,13 @@ class _Adapter:
 
     def __init__(self, *, disconnect_raises: bool = False) -> None:
         self.disconnect_raises = disconnect_raises
+        self.disconnect_calls = 0
 
     async def connect(self) -> None:
         return None
 
     async def disconnect(self) -> None:
+        self.disconnect_calls += 1
         if self.disconnect_raises:
             raise RuntimeError("disconnect failed")
 
@@ -144,6 +146,7 @@ async def test_connect_target_model_refresh_preview_failure(
     result = await model_service.connect_target_model("s1", model_path=str(model_path))
 
     assert result == {"ok": True}
+    assert adapter.disconnect_calls == 1
 
 
 def test_resolve_model_path_sanitize_returns_empty(monkeypatch) -> None:

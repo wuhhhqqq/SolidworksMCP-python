@@ -94,9 +94,11 @@ async def test_validate_solidworks_installation_paths(monkeypatch):
     monkeypatch.setattr(validation_mod.logger, "info", info)
     monkeypatch.setattr(validation_mod.shutil, "which", lambda _p: None)
 
-    # COM available path.
+    # An active-object lookup verifies COM without creating SolidWorks.
     fake_win32com = SimpleNamespace(
-        client=SimpleNamespace(Dispatch=Mock(return_value=object()))
+        client=SimpleNamespace(
+            GetActiveObject=Mock(return_value=object()), Dispatch=Mock()
+        )
     )
     monkeypatch.setitem(sys.modules, "win32com", fake_win32com)
     monkeypatch.setitem(sys.modules, "win32com.client", fake_win32com.client)
@@ -106,12 +108,16 @@ async def test_validate_solidworks_installation_paths(monkeypatch):
 
     assert warning.called
     assert info.called
-    assert "COM interface is available" in info.call_args[0][0]
+    assert "running SolidWorks COM interface is available" in info.call_args[0][0]
+    fake_win32com.client.Dispatch.assert_not_called()
 
-    # COM dispatch failure path.
-    fake_win32com.client.Dispatch = Mock(side_effect=RuntimeError("dispatch error"))
+    # No active object is a warning and must not fall back to Dispatch.
+    fake_win32com.client.GetActiveObject = Mock(
+        side_effect=RuntimeError("not running")
+    )
     await validation_mod._validate_solidworks_installation(cfg)
-    assert "COM interface issue" in warning.call_args[0][0]
+    assert "No running SolidWorks COM interface" in warning.call_args[0][0]
+    fake_win32com.client.Dispatch.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -133,4 +139,4 @@ async def test_validate_solidworks_installation_import_error(monkeypatch):
     cfg = SimpleNamespace(solidworks_path=None)
     await validation_mod._validate_solidworks_installation(cfg)
 
-    assert "COM interface issue" in warning.call_args[0][0]
+    assert "No running SolidWorks COM interface" in warning.call_args[0][0]

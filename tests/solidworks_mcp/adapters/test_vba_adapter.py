@@ -83,6 +83,34 @@ async def test_execute_macro_delegates_executor() -> None:
     assert isinstance(request, MacroExecutionRequest)
 
 
+@pytest.mark.asyncio
+async def test_execute_macro_forwards_trusted_macro_request_to_backing_adapter() -> None:
+    """The VBA wrapper must not rewrite a verified .swp into textual macro source."""
+    backing = SimpleNamespace(
+        execute_macro=AsyncMock(
+            return_value=AdapterResult(status=AdapterResultStatus.SUCCESS, data="ok")
+        )
+    )
+    adapter = VbaGeneratorAdapter(backing)
+
+    result = await adapter.execute_macro(
+        {
+            "macro_path": "C:/trusted/example.swp",
+            "module_name": "Example",
+            "proc_name": "Main",
+        }
+    )
+
+    assert result.is_success
+    backing.execute_macro.assert_awaited_once_with(
+        {
+            "macro_path": "C:/trusted/example.swp",
+            "module_name": "Example",
+            "proc_name": "Main",
+        }
+    )
+
+
 def test_get_macro_execution_history_returns_dict() -> None:
     """Macro history should serialize to plain dicts."""
     # Provide a fake execution history and ensure dict output.

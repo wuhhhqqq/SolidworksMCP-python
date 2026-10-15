@@ -21,6 +21,7 @@ nav:
   - Getting Started:
       - Installation: getting-started/installation.md
       - Quick Start: getting-started/quickstart.md
+      - Embedded SolidWorks Task Pane: getting-started/embedded-task-pane.md
       - Tutorial Tracks: getting-started/tutorial-tracks.md
       - SolidWorks as Code: getting-started/solidworks-as-code.md
       - U-Joint Assembly Build (From Scratch): getting-started/tutorials/u-joint-assembly-build.md
@@ -31,6 +32,7 @@ nav:
   - MCP Server Guide:
       - Architecture: user-guide/architecture.md
       - Tools Overview: user-guide/tools-overview.md
+      - Typed MVP Workflow: user-guide/mvp-workflow.md
       - Platform and Connectivity: user-guide/platform-connectivity.md
       - Prompting Best Practices: user-guide/prompting-best-practices.md
       - Integration Testing: user-guide/integration-testing.md

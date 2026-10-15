@@ -233,7 +233,11 @@ Both on the Front plane.
 
 ## When to Use VBA
 
-Some SolidWorks features are not yet exposed as direct MCP tools. When a plan calls for these, the LLM should use `generate_vba_part_modeling` and `execute_macro` instead:
+Some SolidWorks features are not yet exposed as direct MCP tools. `generate_vba_part_modeling`
+may help draft code for review, but it does not create an executable SolidWorks `.swp`
+project. To run VBA, an administrator must review and provision a real `.swp` with a
+trusted manifest, then the client uses `solidworks_list_trusted_macros`,
+`solidworks_prepare_trusted_macro`, and `solidworks_execute_trusted_macro`.
 
 | Feature | MCP tool | VBA path |
 |---|---|---|
@@ -247,9 +251,9 @@ Some SolidWorks features are not yet exposed as direct MCP tools. When a plan ca
 If your plan includes one of these features, add to your description:
 
 ```text
-Note: if any step requires loft, sweep, or shell, write the
-generate_vba_part_modeling call and flag it clearly rather than
-using a placeholder.
+Note: if any step requires loft, sweep, or shell, flag the required
+trusted macro clearly. Generated source can be attached for review,
+but must not be treated as a runnable `.swp` file.
 ```
 
 ---
@@ -414,7 +418,7 @@ Rules:
 | `Sketch is still active` | `exit_sketch()` not called | Always call `exit_sketch()` before any feature creation |
 | `Plane not found: "front"` | Wrong capitalisation | Must be `"Front"`, `"Top"`, or `"Right"` |
 | `Extrusion failed: sketch not closed` | Profile has a gap | *"Identify the gap in the sketch and add the missing line to close it."* |
-| `create_loft is not implemented` | Loft not yet a direct MCP tool | Use `generate_vba_part_modeling` + `execute_macro` |
+| `SW_SKETCH_NOT_READY` from sweep/loft | A profile, path, or guide was not created and exited in this workflow session | Create and exit every required sketch, then pass only the returned sketch references |
 | `RecoverableFailure` from agent CLI | Schema validation failed | Re-run with `--max-retries-on-recoverable 2` |
 | Part looks 1000× too big or small | Units mismatch | Pass dimensions in mm (values > 0.5); server normalises automatically |
 

@@ -2,6 +2,10 @@
 
 This page documents what is validated with real SolidWorks and what is still simulated.
 
+For the current source audit, known gaps, and the distinction between mock smoke
+results and real execution acceptance, see the
+[2026-10-14 functional closure audit](../planning/functional-closure-audit-2026-10-14.md).
+
 ## Validation Model
 
 The project uses two layers:
@@ -84,7 +88,9 @@ make test-clean
 
 - Windows 10/11.
 - Local SolidWorks installation.
-- SolidWorks launchable and COM-accessible.
+- Start SolidWorks from its desktop shortcut and wait until it is COM-accessible.
+  The MCP attaches only to an already-running instance and never launches it
+  through COM.
 - SOLIDWORKS_MCP_RUN_REAL_INTEGRATION=true (handled by make test-full).
 
 ## Expected Generated Artifacts

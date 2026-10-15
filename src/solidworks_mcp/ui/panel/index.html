@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <title>SolidWorks MCP</title>
+  <style>
+    * { box-sizing:border-box; }
+    body { margin:0; min-width:280px; background:#15181d; color:#e8edf2; font:13px "Segoe UI",Arial,sans-serif; }
+    header { padding:12px; background:#1a1e24; border-bottom:1px solid #39434e; }
+    .brand { display:flex; align-items:center; gap:8px; font-size:16px; font-weight:600; }
+    .mark { width:22px; height:22px; line-height:22px; text-align:center; background:#4aa3df; color:#07131c; border-radius:4px; font-weight:800; }
+    .status { margin-top:8px; color:#9ca9b5; font-size:12px; }
+    .dot { width:8px; height:8px; border-radius:50%; background:#7c8792; }
+    .dot.ok { background:#63c48b; } .dot.bad { background:#e37474; }
+    main { min-height:calc(100vh - 70px); }
+    aside { float:left; width:34%; min-width:170px; min-height:calc(100vh - 70px); border-right:1px solid #39434e; }
+    section { margin-left:34%; }
+    .filters { padding:10px; border-bottom:1px solid #39434e; }
+    input, select, textarea, button { font:inherit; color:#e8edf2; background:#272e37; border:1px solid #39434e; border-radius:4px; }
+    input, select, textarea { width:100%; padding:7px 8px; }
+    input:focus, select:focus, textarea:focus { outline:1px solid #4aa3df; border-color:#4aa3df; }
+    .category { padding:9px 10px 5px; color:#9ca9b5; text-transform:uppercase; font-size:10px; letter-spacing:.06em; }
+    .tool { display:block; width:100%; padding:7px 10px; border:0; border-left:3px solid transparent; border-radius:0; background:transparent; text-align:left; cursor:pointer; }
+    .tool:hover { background:#2b333d; } .tool.selected { background:#263d4d; border-left-color:#4aa3df; }
+    .tool-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .tool-count { float:right; color:#9ca9b5; font-size:11px; }
+    section { min-width:0; padding:16px; }
+    .empty { color:#9ca9b5; padding:30px 4px; text-align:center; }
+    h1 { margin:0 0 5px; font-size:18px; word-wrap:break-word; } .description { color:#9ca9b5; line-height:1.5; margin-bottom:14px; white-space:pre-wrap; }
+    .meta { margin-bottom:14px; }
+    .badge { display:inline-block; margin-right:6px; padding:3px 7px; border:1px solid #39434e; border-radius:10px; color:#9ca9b5; font-size:11px; }
+    .badge.warn { color:#f1b4a0; border-color:#80534d; }
+    .field { margin:0 0 11px; } label { display:block; margin-bottom:4px; color:#cbd5de; } .required { color:#f1b4a0; }
+    .hint { color:#9ca9b5; font-size:11px; margin-top:3px; }
+    textarea.json { min-height:90px; resize:vertical; font-family:Consolas,monospace; font-size:12px; }
+    .actions { margin-top:15px; } .actions button { margin-right:8px; }
+    button { padding:7px 12px; cursor:pointer; } button.primary { background:#4aa3df; border-color:#4aa3df; color:#07131c; font-weight:600; } button:disabled { opacity:.55; cursor:wait; }
+    .result { margin-top:16px; border-top:1px solid #39434e; padding-top:12px; } pre { margin:0; max-height:360px; overflow:auto; padding:10px; background:#111419; border:1px solid #39434e; border-radius:4px; white-space:pre-wrap; word-wrap:break-word; font:12px Consolas,monospace; }
+    .ok-text { color:#63c48b; } .error-text { color:#e37474; }
+    @media (max-width:620px) { aside { float:none; width:auto; min-height:0; max-height:38vh; overflow:auto; border-right:0; border-bottom:1px solid #39434e; } section { margin-left:0; padding:12px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand"><span class="mark">SW</span><span>SolidWorks MCP</span></div>
+    <div class="status"><span id="status-dot" class="dot"></span><span id="status-text">正在连接</span><button id="start-sw" type="button">启动 SolidWorks</button><button id="refresh" type="button">刷新</button><span id="tool-total" class="tool-count"></span></div>
+  </header>
+  <main>
+    <aside>
+      <div class="filters"><input id="search" type="search" placeholder="搜索工具" autocomplete="off"></div>
+      <div id="tool-list"><div class="empty">加载工具目录...</div></div>
+    </aside>
+    <section id="workspace"><div class="empty">选择一个工具</div></section>
+  </main>
+  <script>
+    /* ES5-compatible code keeps the panel usable in SolidWorks 2019's WebBrowser control. */
+    var state = { tools: [], selected: null };
+    function $(id) { return document.getElementById(id); }
+    function esc(s) { return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, function(c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+    function schemaFor(s) { if (!s || typeof s !== 'object') return {}; if (s.anyOf) { for (var i=0;i<s.anyOf.length;i++) if (s.anyOf[i].type !== 'null') return s.anyOf[i]; } if (s.oneOf && s.oneOf.length) return s.oneOf[0]; return s; }
+    function propertyEntries(schema) { var s=schemaFor(schema), out=[]; var props=s.properties || {}; for (var k in props) if (Object.prototype.hasOwnProperty.call(props,k)) out.push([k,props[k]]); return out; }
+    function renderTools() { var q=$('search').value.trim().toLowerCase(), groups={}, i, t, cat, html=''; for(i=0;i<state.tools.length;i++){t=state.tools[i]; if(q && (t.name+' '+t.description+' '+t.category).toLowerCase().indexOf(q)<0) continue; cat=t.category; if(!groups[cat]) groups[cat]=[]; groups[cat].push(t);} var cats=[]; for(cat in groups) if(Object.prototype.hasOwnProperty.call(groups,cat)) cats.push(cat); cats.sort(); for(i=0;i<cats.length;i++){cat=cats[i]; html+='<div class="category">'+esc(cat)+' <span class="tool-count">'+groups[cat].length+'</span></div>'; for(var j=0;j<groups[cat].length;j++){t=groups[cat][j]; html+='<button class="tool '+(state.selected && state.selected.name===t.name?'selected':'')+'" data-tool="'+esc(t.name)+'"><span class="tool-name">'+esc(t.name)+'</span></button>';}} $('tool-list').innerHTML=html||'<div class="empty">没有匹配工具</div>'; var buttons=$('tool-list').querySelectorAll('[data-tool]'); for(i=0;i<buttons.length;i++) buttons[i].onclick=function(){selectTool(this.getAttribute('data-tool'));}; }
+    function fieldHtml(name,schema,required) { var s=schemaFor(schema), id='arg-'+name.replace(/[^a-zA-Z0-9_-]/g,'_'), label='<label for="'+id+'">'+esc(name)+(required?' <span class="required">*</span>':'')+'</label>', html='<div class="field">'+label; if(s.enum instanceof Array){html+='<select id="'+id+'" data-type="enum"'+(required?' required':'')+'><option value="">请选择</option>'; for(var i=0;i<s.enum.length;i++) html+='<option value="'+esc(s.enum[i])+'">'+esc(s.enum[i])+'</option>'; return html+'</select></div>';} if(s.type==='boolean') return html+'<select id="'+id+'" data-type="boolean"><option value="">未设置</option><option value="true">是</option><option value="false">否</option></select></div>'; if(s.type==='array'||s.type==='object'||!s.type) return html+'<textarea class="json" id="'+id+'" data-type="json" placeholder="'+(s.type==='array'?'[ ]':'{ }')+'"'+(required?' required':'')+'></textarea><div class="hint">JSON</div></div>'; var inputType=(s.type==='integer'||s.type==='number')?'number':'text', value=s.default!==undefined?' value="'+esc(s.default)+'"':''; return html+'<input id="'+id+'" type="'+inputType+'" data-type="'+esc(s.type)+'"'+value+(required?' required':'')+'>'+(s.description?'<div class="hint">'+esc(s.description)+'</div>':'')+'</div>'; }
+    function renderWorkspace(t) { var schema=t.parameters||{}, required={}, req=schema.required||[], entries=propertyEntries(schema), fields='', i; for(i=0;i<req.length;i++) required[req[i]]=true; for(i=0;i<entries.length;i++) fields+=fieldHtml(entries[i][0],entries[i][1],!!required[entries[i][0]]); $('workspace').innerHTML='<h1>'+esc(t.title||t.name)+'</h1><div class="description">'+esc(t.description)+'</div><div class="meta"><span class="badge">'+esc(t.category)+'</span>'+(t.requires_confirmation?'<span class="badge warn">需要确认</span>':'')+'<span class="badge">'+entries.length+' 参数</span></div><form id="tool-form">'+(fields||'<div class="empty">此工具没有输入参数</div>')+'<div class="actions"><button class="primary" id="execute" type="submit">执行</button><button type="button" id="clear">清空</button></div></form><div id="result" class="result" hidden></div>'; $('clear').onclick=function(){$('tool-form').reset();}; $('tool-form').onsubmit=executeSelected; }
+    function selectTool(name) { for(var i=0;i<state.tools.length;i++) if(state.tools[i].name===name){state.selected=state.tools[i]; renderTools(); renderWorkspace(state.selected); return;} }
+    function collectArguments(t) { var args={}, entries=propertyEntries(t.parameters); for(var i=0;i<entries.length;i++){var name=entries[i][0], el=$('arg-'+name.replace(/[^a-zA-Z0-9_-]/g,'_')); if(!el||el.value==='') continue; try { args[name]=el.getAttribute('data-type')==='json'?JSON.parse(el.value):el.getAttribute('data-type')==='integer'?parseInt(el.value,10):el.getAttribute('data-type')==='number'?Number(el.value):el.getAttribute('data-type')==='boolean'?el.value==='true':el.value; } catch(e){ throw new Error('参数 '+name+' 不是有效 JSON'); }} return args; }
+    function xhr(method,url,body,done,fail){var x=new XMLHttpRequest(); x.open(method,url,true); x.setRequestHeader('Content-Type','application/json'); x.onreadystatechange=function(){if(x.readyState!==4)return; if(x.status>=200&&x.status<300){try{done(JSON.parse(x.responseText));}catch(e){fail(e);}}else fail(new Error('HTTP '+x.status));}; x.onerror=function(){fail(new Error('本地服务不可用'));}; x.send(body?JSON.stringify(body):null);}
+    function setHealth(health){var connected=!!(health&&health.connected); $('status-dot').className='dot '+(connected?'ok':'bad'); $('status-text').textContent=connected?'SolidWorks 已连接':'SolidWorks 未连接'; $('start-sw').disabled=connected;}
+    function startSolidWorks(){var button=$('start-sw'); button.disabled=true; $('status-text').textContent='正在启动 SolidWorks'; xhr('POST','/api/panel/start-solidworks',{timeout_seconds:120},function(data){if(data&&data.ok){setHealth({connected:true});}else{setHealth({connected:false}); window.alert((data&&data.error)||'SolidWorks 启动失败'); button.disabled=false;}},function(err){setHealth({connected:false}); window.alert(err.message); button.disabled=false;});}
+    function executeSelected(ev) { ev.preventDefault(); var button=$('execute'), result=$('result'); button.disabled=true; result.hidden=false; result.innerHTML='<pre>执行中...</pre>'; try { var args=collectArguments(state.selected), confirmed=!state.selected.requires_confirmation || window.confirm('此操作可能修改、删除或覆盖 SolidWorks 数据，确定继续？'); if(!confirmed){result.innerHTML='<div class="error-text">已取消</div>'; button.disabled=false; return;} xhr('POST','/api/panel/tools/'+encodeURIComponent(state.selected.name)+'/execute',{arguments:args,confirmed:confirmed},function(data){result.innerHTML='<div class="'+(data.ok?'ok-text':'error-text')+'">'+(data.ok?'完成':'失败')+'</div><pre>'+esc(JSON.stringify(data,null,2))+'</pre>';button.disabled=false;},function(err){result.innerHTML='<div class="error-text">'+esc(err.message)+'</div>';button.disabled=false;}); } catch(e){result.innerHTML='<div class="error-text">'+esc(e.message)+'</div>';button.disabled=false;} }
+    function load(){xhr('GET','/api/panel/tools',null,function(catalog){state.tools=catalog.tools||[]; $('tool-total').textContent=state.tools.length+' 工具'; renderTools(); xhr('GET','/api/panel/health',null,function(health){setHealth(health);},function(){ setHealth({connected:false}); $('status-text').textContent='连接状态未知';});},function(){ setHealth({connected:false}); $('status-text').textContent='面板服务不可用'; $('tool-list').innerHTML='<div class="empty">无法连接本地 MCP 服务，正在重试...</div>'; window.setTimeout(load,2000);});}
+    $('search').oninput=renderTools; $('refresh').onclick=load; $('start-sw').onclick=startSolidWorks; load();
+  </script>
+</body>
+</html>

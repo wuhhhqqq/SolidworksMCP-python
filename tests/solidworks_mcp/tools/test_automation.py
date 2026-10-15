@@ -453,22 +453,16 @@ class TestAutomationTools:
             input_data={"optimization_type": "general"}
         )
 
-        assert vba["status"] == "success"
-        assert "vba_code" in vba
-        assert start["status"] == "success"
-        assert start["macro_recording"]["status"] == "recording"
-        assert stop["status"] == "success"
-        assert stop["macro_recording"]["status"] == "stopped"
-        assert batch["status"] == "success"
-        assert batch["batch_process"]["files_found"] == 25
-        assert table["status"] == "success"
-        assert table["design_table"]["operation"] == "create"
-        assert workflow["status"] == "success"
-        assert workflow["workflow"]["total_steps"] == 1
-        assert template["status"] == "success"
-        assert template["template"]["type"] == "part"
-        assert optimize["status"] == "success"
-        assert optimize["optimization"]["settings_optimized"] == 12
+        assert vba["status"] == "unsupported"
+        assert start["status"] == "unsupported"
+        assert start["status"] == "unsupported"
+        assert stop["status"] == "unsupported"
+        assert stop["status"] == "unsupported"
+        assert batch["status"] == "unsupported"
+        assert table["status"] == "unsupported"
+        assert workflow["status"] == "unsupported"
+        assert template["status"] == "unsupported"
+        assert optimize["status"] == "unsupported"
 
     @pytest.mark.asyncio
     async def test_automation_exception_paths_from_adapter_methods(
