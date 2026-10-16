@@ -1,5 +1,7 @@
 # Architecture Overview
 
+For the transformer design workbench integration boundary, capability evidence model, operation envelope, and staged validation plan, see [Transformer Design Workbench Integration Design](../planning/transformer-unified-integration-design.md). That document is an integration supplement; it does not turn the generic tool catalog or mock adapter into production engineering validation.
+
 The SolidWorks MCP Server implements an intelligent, multi-layered architecture designed to overcome the limitations of traditional COM-based SolidWorks automation while providing enterprise-grade reliability and security.
 
 ## High-Level Architecture
