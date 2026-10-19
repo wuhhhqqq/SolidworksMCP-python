@@ -1,17 +1,17 @@
 # SolidWorks MCP 在总体目标架构中的定位
 
-版本：1.0  日期：2026-10-16
+版本：1.1  日期：2026-10-18
 
-SolidWorks MCP 位于总体目标架构的“工程专业工具集”区域，是变压器领域服务调用 SolidWorks 的受控执行器。HydroAgent 负责通用 Agent/Skill 和交互；变压器项目负责设计基线、参数映射、检查、审批和发布；本项目负责 SolidWorks 会话、模型/装配/工程图操作以及原生几何证据。
+SolidWorks MCP 是变压器领域服务调用 SolidWorks 的受控执行器。变压器设计智能体负责通用 Agent/Skill 和交互；变压器项目负责设计基线、参数映射、十二类检查、审批和发布；本项目负责 SolidWorks 会话、模型/装配/工程图操作以及原生几何证据。
 
 ```text
-HydroAgent Agent/Skill -> 变压器领域动作 -> SolidWorks 适配器/worker
+变压器设计智能体 -> 变压器领域动作 -> SolidWorks 适配器/worker
  -> SolidWorks MCP stdio -> SolidWorks COM/API -> 模型、装配、工程图、BOM、测量证据
 ```
 
 ## 内部功能
 
-| 内部模块 | 职责 |
+| 模块 | 职责 |
 |---|---|
 | MCP 工具层 | 工具注册、参数校验、协议响应 |
 | 能力与身份层 | SolidWorks 版本、后端、PID、连接归属和动作验证状态 |
@@ -22,20 +22,8 @@ HydroAgent Agent/Skill -> 变压器领域动作 -> SolidWorks 适配器/worker
 
 ## 对外接口
 
-| 接口 | 用途 |
-|---|---|
-| `solidworks_get_capabilities` | 返回版本、后端、PID、连接归属、支持动作和验证状态 |
-| `solidworks_get_session` | 返回会话、租约、当前文档、配置和读写状态 |
-| `solidworks_acquire_lease` / `solidworks_release_lease` | 获取或释放唯一写入租约 |
-| `prepare_model_workspace` | 创建独立工作区并应用受控模板 |
-| `create_or_open_model` | 创建/打开零件或装配并确认配置 |
-| `apply_parameterized_template` | 按批准映射修改尺寸、材料和配置 |
-| `read_geometry_evidence` | 返回包围盒、体积、质量、孔位、距离等原生测量 |
-| `verify_assembly_interference` | 执行装配重建和干涉检查 |
-| `create_engineering_drawing` | 创建工程图、视图、标注和 BOM |
-| `save_reopen_verify` / `export_artifacts` | 保存重开回读并生成产物清单 |
-| `solidworks_cancel_operation` | 请求取消并保留未知状态 |
+`solidworks_get_capabilities`、`solidworks_get_session`、`solidworks_acquire_lease`、`solidworks_release_lease`、`prepare_model_workspace`、`create_or_open_model`、`apply_parameterized_template`、`read_geometry_evidence`、`verify_assembly_interference`、`create_engineering_drawing`、`save_reopen_verify`、`export_artifacts`、`solidworks_cancel_operation`。
 
-统一结果必须包含 `task_id`、`run_id`、`operation_id`、`execution_status`、`engineering_status`、`evidence_status`、软件版本、输入哈希、产物和原始响应引用。`BUSY`、`TIMEOUT_UNKNOWN`、`UNKNOWN_NEEDS_RECONCILIATION` 不得自动重放写操作。
+## 实现状态
 
-本项目不负责变压器工程 PASS、十二类检查最终判定、企业审批和发布。基准件、原生测量、装配干涉、工程图/BOM、保存关闭重开再测量和异常恢复必须逐项实机验收。
+上述接口包含已实现的底层 MCP 能力、部分实现的业务封装和计划实现的变压器高层动作，不能仅凭接口名称视为已完成。每次结果必须区分 `implementation_status`（SIMULATION/RUNTIME_REPORTED/VERIFIED_ACTION/UNKNOWN）、`execution_status`、`engineering_status` 和 `evidence_status`。未完成基准件、原生测量、保存重开和异常恢复验收的动作不得标记为 VERIFIED_ACTION。SolidWorks MCP 不负责工程 PASS、十二类检查最终判定、审批或发布。

@@ -111,19 +111,16 @@ async def real_server(
         await server.adapter.connect()
     except Exception as exc:
         await server.stop()
-        pytest.skip(f"Could not connect to local SolidWorks instance: {exc}")
+        pytest.fail(f"Could not connect to local SolidWorks instance: {exc}")
 
     try:
         yield server
     finally:
-        # Close only documents that were opened/created during this test session.
-        # Unwrap circuit-breaker/pool wrappers to reach the pywin32 adapter directly.
-        underlying = server.adapter
-        while hasattr(underlying, "adapter"):
-            underlying = underlying.adapter
-        if hasattr(underlying, "close_all_session_docs"):
+        # Keep the public adapter wrappers intact: in particular, the STA
+        # wrapper must marshal this cleanup call onto the COM-owning thread.
+        if hasattr(server.adapter, "close_all_session_docs"):
             try:
-                await underlying.close_all_session_docs()
+                await server.adapter.close_all_session_docs()
             except Exception:
                 pass
         else:
@@ -137,9 +134,9 @@ async def real_server(
 
 
 @pytest.fixture
-def integration_output_dir() -> Path:
+def integration_output_dir(tmp_path: Path) -> Path:
     """Test helper for integration output dir."""
-    output_dir = Path("tests") / ".generated" / "solidworks_integration"
+    output_dir = tmp_path / "solidworks_integration"
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
@@ -599,6 +596,11 @@ async def test_real_part_create_save_open_close(
     part_result = await create_part(CreatePartInput(name="MCP_Integration_Part"))
     assert part_result["status"] == "success", part_result
 
+    property_result = await real_server.adapter.set_custom_property(
+        "MCP_Closeout_Verification", "created-modified-saved"
+    )
+    assert property_result.is_success, property_result
+
     part_path = integration_output_dir / "mcp_integration_part.sldprt"
     save_as_result = await save_as(
         SaveAsInput(
@@ -611,16 +613,24 @@ async def test_real_part_create_save_open_close(
     assert part_path.exists(), f"Expected saved part at {part_path}"
 
     close_result = await close_model(CloseModelInput(save=False))
-    assert close_result["status"] in {"success", "error"}
+    assert close_result["status"] == "success", close_result
 
     open_result = await open_model(OpenModelInput(file_path=str(part_path)))
     assert open_result["status"] == "success", open_result
+
+    properties = await real_server.adapter.list_custom_properties()
+    assert properties.is_success, properties
+    assert any(
+        item["name"] == "MCP_Closeout_Verification"
+        and item["value"] == "created-modified-saved"
+        for item in properties.data or []
+    ), properties
 
     save_result = await save_file(SaveFileInput(force_save=True))
     assert save_result["status"] == "success", save_result
 
     final_close = await close_model(CloseModelInput(save=True))
-    assert final_close["status"] in {"success", "error"}
+    assert final_close["status"] == "success", final_close
 
 
 @pytest.mark.asyncio

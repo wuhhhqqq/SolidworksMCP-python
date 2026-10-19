@@ -244,19 +244,19 @@ async def test_drawing_tools_simulation_branches(mcp_server, mock_config):
         await (await _tool(mcp_server, "create_drawing_view"))(
             input_data=CreateDrawingViewInput(model_path="m.sldprt", view_type="front")
         )
-    )["status"] == "success"
+    )["status"] == "unsupported"
     assert (
         await (await _tool(mcp_server, "add_dimension"))(
             input_data=DrawingAddDimensionInput(
                 dimension_type="linear", entity1="L1", position_x=1, position_y=2
             )
         )
-    )["status"] == "success"
+    )["status"] == "unsupported"
     assert (
         await (await _tool(mcp_server, "add_note"))(
             input_data=AddNoteInput(text="n", position_x=1, position_y=2)
         )
-    )["status"] == "success"
+    )["status"] == "unsupported"
     assert (
         await (await _tool(mcp_server, "create_section_view"))(
             input_data=CreateSectionViewInput(
@@ -266,36 +266,36 @@ async def test_drawing_tools_simulation_branches(mcp_server, mock_config):
                 view_position_y=2,
             )
         )
-    )["status"] == "success"
+    )["status"] == "unsupported"
     assert (
         await (await _tool(mcp_server, "create_detail_view"))(
             input_data=CreateDetailViewInput(
                 center_x=0, center_y=0, radius=2, view_position_x=3, view_position_y=4
             )
         )
-    )["status"] == "success"
+    )["status"] == "unsupported"
     assert (
         await (await _tool(mcp_server, "update_sheet_format"))(
             input_data=UpdateSheetFormatInput(format_file="f.slddrt")
         )
-    )["status"] == "success"
+    )["status"] == "unsupported"
     assert (
         await (await _tool(mcp_server, "auto_dimension_view"))(
             input_data={"view_name": "Front"}
         )
-    )["status"] == "success"
+    )["status"] == "unsupported"
     assert (
         await (await _tool(mcp_server, "check_drawing_standards"))(
             input_data={"standard": "ANSI"}
         )
-    )["status"] == "success"
+    )["status"] == "unsupported"
 
     alias_result = await (await _tool(mcp_server, "add_dimension"))(
         input_data=DimensionInput(
             entities=["E1", "E2"], position=[5, 6], dimension_type="linear"
         )
     )
-    assert alias_result["status"] == "success"
+    assert alias_result["status"] == "unsupported"
 
     assert (
         await (await _tool(mcp_server, "create_technical_drawing"))(
@@ -303,17 +303,17 @@ async def test_drawing_tools_simulation_branches(mcp_server, mock_config):
                 output_path="o.slddrw", auto_populate_views=True
             )
         )
-    )["status"] == "success"
+    )["status"] == "unsupported"
     assert (
         await (await _tool(mcp_server, "add_drawing_view"))(
             input_data=DrawingViewInput(
                 view_name="Front", view_type="front", position=[1, 1]
             )
         )
-    )["status"] == "success"
+    )["status"] == "unsupported"
     assert (
         await (await _tool(mcp_server, "update_title_block"))(input_data={"title": "A"})
-    )["status"] == "success"
+    )["status"] == "unsupported"
 
 
 class _ExportFallbackAdapter:
@@ -785,6 +785,7 @@ async def test_mock_adapter_additional_feature_and_dimension_paths(mock_config):
         await adapter.create_revolve(
             SimpleNamespace(
                 angle=120,
+                is_cut=False,
                 reverse_direction=False,
                 both_directions=False,
                 thin_feature=False,
@@ -794,13 +795,14 @@ async def test_mock_adapter_additional_feature_and_dimension_paths(mock_config):
     ).is_success
     assert (
         await adapter.create_sweep(
-            SimpleNamespace(path="Sketch2", twist_along_path=True, twist_angle=30)
+            SimpleNamespace(profile="Sketch1", path="Sketch2", twist_along_path=True, twist_angle=30, is_cut=False)
         )
     ).is_success
     assert (
         await adapter.create_loft(
             SimpleNamespace(
                 profiles=["S1", "S2"],
+                is_cut=False,
                 guide_curves=["G1"],
                 start_tangent=True,
                 end_tangent=False,

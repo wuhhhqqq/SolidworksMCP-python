@@ -375,8 +375,9 @@ def test_com_executor_stop_warns_when_thread_doesnt_exit(monkeypatch):
     executor._thread = mock_thread
 
     executor.stop(timeout=0.001)
-    # Thread should be set to None even though it didn't stop cleanly
-    assert executor._thread is None
+    # Preserve the live handle so start() cannot create a second STA worker.
+    assert executor._thread is mock_thread
+    assert executor._stopping
 
 
 # ---------------------------------------------------------------------------

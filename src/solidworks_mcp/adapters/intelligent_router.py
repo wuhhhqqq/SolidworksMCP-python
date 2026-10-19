@@ -60,34 +60,12 @@ class IntelligentRouter:
         """
         self._analyzer = analyzer
         self._cache = cache
-        self._cacheable_operations = cacheable_operations or {
-            # Lightweight metadata operations
-            "get_model_info",
-            "list_features",
-            "list_configurations",
-            "get_file_properties",
-            "get_dimension",
-            # Analysis operations — NOT cached: model state changes with
-            # every feature-creation tool call and the router has no
-            # automatic invalidation. Caching these produced stale
-            # volumes mid-build.
-            # "get_mass_properties",
-            # "calculate_mass_properties",
-            "get_material_properties",
-            "analyze_geometry",
-            "check_interference",
-            # Drawing analysis operations
-            "analyze_drawing_comprehensive",
-            "analyze_drawing_dimensions",
-            "analyze_drawing_views",
-            "analyze_drawing_annotations",
-            "check_drawing_compliance",
-            "check_drawing_standards",
-            "compare_drawing_versions",
-            # Classification and indexing
-            "classify_feature_tree",
-            "discover_solidworks_docs",
-        }
+        # Desktop edits can change CAD state outside MCP's revision registry.
+        # Never cache model reads until a reliable native change token exists.
+        self._cacheable_operations = (
+            {"discover_solidworks_docs"}
+            if cacheable_operations is None else set(cacheable_operations)
+        )
 
     async def execute(
         self,

@@ -26,6 +26,14 @@ from solidworks_mcp.server import SolidWorksMCPServer
 os.environ["USE_MOCK_SOLIDWORKS"] = "true"
 
 
+@pytest.fixture(autouse=True)
+def isolated_history_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let tests write to the user's persistent agent history."""
+    from solidworks_mcp.agents import history_db
+
+    monkeypatch.setattr(history_db, "DEFAULT_DB_PATH", tmp_path / "agent_memory.sqlite3")
+
+
 @pytest.fixture(scope="session")
 def event_loop() -> Generator[asyncio.AbstractEventLoop, None, None]:
     """Create event loop for async tests."""

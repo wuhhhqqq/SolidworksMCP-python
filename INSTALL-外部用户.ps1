@@ -59,10 +59,14 @@ if (-not (Test-Path $venvPython)) {
 Write-Host "安装/更新 MCP 运行依赖..." -ForegroundColor Green
 & $venvPython -m ensurepip --upgrade
 & $venvPython -m pip install --upgrade pip setuptools wheel
-$bundledWheel = Join-Path $projectDir "solidworks_mcp_python-1.0.2-py3-none-any.whl"
+$bundledWheel = Join-Path $projectDir "solidworks_mcp_python-1.0.3-py3-none-any.whl"
 if (Test-Path -LiteralPath $bundledWheel) {
+    & $venvPython -m pip install --upgrade --force-reinstall --no-deps "$bundledWheel"
+    if ($LASTEXITCODE -ne 0) { throw "MCP wheel 更新失败。" }
     & $venvPython -m pip install "$bundledWheel`[ui`]"
 } else {
+    & $venvPython -m pip install --no-deps --force-reinstall .
+    if ($LASTEXITCODE -ne 0) { throw "MCP 源码安装失败。" }
     & $venvPython -m pip install ".[ui]"
 }
 if ($LASTEXITCODE -ne 0) { throw "MCP 安装失败，请检查上方 pip 错误。" }

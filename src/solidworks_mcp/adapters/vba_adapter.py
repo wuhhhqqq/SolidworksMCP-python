@@ -96,7 +96,7 @@ class VbaGeneratorAdapter:
         health = await self._backing_adapter.health_check()
         if hasattr(health, "metrics"):
             metrics = dict(health.metrics or {})
-            metrics["route"] = "vba"
+            metrics["route"] = "com"
             health.metrics = metrics
         return health
 
@@ -198,7 +198,8 @@ class VbaGeneratorAdapter:
         metadata = dict(result.metadata or {})
         metadata.update(
             {
-                "route": "vba",
+                "route": "com",
+                "vba_executed": False,
                 "operation": operation,
                 "vba_code": vba_code,
                 "generated_at": datetime.utcnow().isoformat(),

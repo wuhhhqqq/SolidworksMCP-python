@@ -121,6 +121,14 @@ class ConnectionPoolAdapter(SolidWorksAdapter):
         self._lock = asyncio.Lock()
         self.timeout = timeout if timeout is not None else 30.0
 
+    async def run_native(self, callback: Any) -> Any:
+        """Run compound native work using one leased STA adapter, without retries."""
+        adapter = await self._get_adapter()
+        try:
+            return await adapter.run_native(callback)
+        finally:
+            await self._return_adapter(adapter)
+
     async def _attempt_async(
         self, operation: Callable[[], Awaitable[T]], default: T | None = None
     ) -> T | None:

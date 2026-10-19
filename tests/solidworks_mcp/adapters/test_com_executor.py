@@ -89,9 +89,8 @@ def test_start_unblocks_when_coinitialize_fails(monkeypatch) -> None:
 
     # Worker should signal readiness then exit; submit should fail fast.
     executor = com_executor.ComExecutor(name="test-init-fail")
-    executor.start()
-    assert executor._thread is not None
-    assert not executor._thread.is_alive()
+    with pytest.raises(RuntimeError, match="initialization failed"):
+        executor.start()
     with pytest.raises(RuntimeError, match="not running"):
         executor.submit(lambda: "nope")
     executor.stop()

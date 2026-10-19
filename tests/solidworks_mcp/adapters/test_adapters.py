@@ -926,6 +926,47 @@ class TestPyWin32AdapterBranches:
         adapter.swApp.CloseDoc.assert_called_once_with("SavedAssembly.sldasm")
 
     @pytest.mark.asyncio
+    async def test_close_model_reads_path_before_closing_com_document(self, monkeypatch):
+        """Do not access a disconnected IModelDoc2 after CloseDoc returns."""
+        import os
+
+        from solidworks_mcp.adapters.solidworks import io
+
+        adapter = self._build_adapter(monkeypatch)
+        model_path = os.path.abspath("saved-part.sldprt")
+
+        class _Document:
+            closed = False
+
+            def GetTitle(self):
+                return "saved-part.sldprt"
+
+            def GetPathName(self):
+                if self.closed:
+                    raise RuntimeError("RPC_E_DISCONNECTED")
+                return model_path
+
+        model = _Document()
+
+        def close_document(_title):
+            model.closed = True
+
+        adapter.currentModel = model
+        adapter.swApp = SimpleNamespace(CloseDoc=Mock(side_effect=close_document))
+        cache_key = os.path.normcase(model_path)
+        monkeypatch.setattr(
+            io, "_OPEN_DOCUMENT_CACHE", {cache_key: (adapter.swApp, model)}
+        )
+        adapter._track_session_document(model)
+
+        result = await adapter.close_model()
+
+        assert result.is_success
+        assert adapter.currentModel is None
+        assert cache_key not in io._OPEN_DOCUMENT_CACHE
+        assert adapter._session_owned_documents == []
+
+    @pytest.mark.asyncio
     async def test_drawing_cad_export_uses_model_space_and_restores_preference(
         self, monkeypatch
     ):

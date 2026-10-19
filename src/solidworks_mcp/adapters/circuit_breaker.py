@@ -118,6 +118,18 @@ class CircuitBreakerAdapter(SolidWorksAdapter):
         self.last_failure_time: float = 0.0
         self.half_open_calls = 0
 
+    async def run_native(self, callback: Any) -> Any:
+        """Keep compound legacy calls inside the native STA boundary."""
+        if not self._should_allow_request():
+            raise RuntimeError("SolidWorks circuit breaker is open")
+        try:
+            result = await self.adapter.run_native(callback)
+        except Exception:
+            self._record_failure()
+            raise
+        self._record_success()
+        return result
+
     async def _invoke_with_optional_args(
         self,
         method: Callable[..., Awaitable[T]],

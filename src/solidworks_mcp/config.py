@@ -404,12 +404,17 @@ class SolidWorksMCPConfig(BaseModel):
         Returns:
             SolidWorksMCPConfig: The result produced by the operation.
         """
-        self.enable_circuit_breaker = self.circuit_breaker_enabled
-        self.enable_connection_pooling = self.connection_pooling
-        self.connection_pool_size = self.max_connections
-        self.enable_rate_limiting = self.rate_limit_enabled
-        if self.allowed_origins and not self.cors_origins:
-            self.cors_origins = list(self.allowed_origins)
+        for canonical, alias in (
+            ("enable_circuit_breaker", "circuit_breaker_enabled"),
+            ("enable_connection_pooling", "connection_pooling"),
+            ("connection_pool_size", "max_connections"),
+            ("enable_rate_limiting", "rate_limit_enabled"),
+            ("cors_origins", "allowed_origins"),
+        ):
+            if alias in self.model_fields_set and canonical not in self.model_fields_set:
+                setattr(self, canonical, getattr(self, alias))
+            # The canonical field wins when both names were explicitly supplied.
+            setattr(self, alias, getattr(self, canonical))
         return self
 
     @field_validator("cache_dir")

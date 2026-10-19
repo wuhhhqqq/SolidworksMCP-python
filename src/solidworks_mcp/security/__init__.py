@@ -36,6 +36,11 @@ async def setup_security(mcp: Any, config: SolidWorksMCPConfig) -> None:
     """
     from ..config import SecurityLevel
 
+    if callable(getattr(mcp, "add_middleware", None)):
+        from .middleware import ToolSecurityMiddleware
+
+        mcp.add_middleware(ToolSecurityMiddleware(config))
+
     if config.security_level == SecurityLevel.MINIMAL:
         # Local only, minimal security
         global _security_enforcer

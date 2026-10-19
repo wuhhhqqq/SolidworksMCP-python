@@ -86,10 +86,17 @@ class ComExecutor:
         # to block until the executor is truly ready.
         self._ready = threading.Event()
         self._stopped = threading.Event()
+        self._lifecycle_lock = threading.RLock()
+        self._stopping = False
+        self._init_error: Exception | None = None
 
     # ---- Public API ----
 
     def start(self, timeout: float = 10.0) -> None:
+        with self._lifecycle_lock:
+            self._start(timeout)
+
+    def _start(self, timeout: float) -> None:
         """Launch the worker thread and wait until it has CoInitialized.
 
         Idempotent: calling ``start()`` on a running executor is a no-op.
@@ -102,6 +109,8 @@ class ComExecutor:
             RuntimeError: Worker didn't become ready in time.
         """
         if self._thread is not None and self._thread.is_alive():
+            if self._stopping:
+                raise RuntimeError("ComExecutor is stopping; wait for native work to finish")
             return
 
         if not PYWIN32_AVAILABLE:
@@ -109,18 +118,28 @@ class ComExecutor:
 
         self._ready.clear()
         self._stopped.clear()
+        self._stopping = False
+        self._init_error = None
         self._thread = threading.Thread(
             target=self._worker, name=self._name, daemon=True
         )
         self._thread.start()
 
         if not self._ready.wait(timeout):
+            self._stopping = True
+            self._queue.put(_SHUTDOWN)
             raise RuntimeError(
                 f"ComExecutor worker '{self._name}' did not "
                 f"initialize within {timeout}s"
             )
+        if self._init_error is not None:
+            raise RuntimeError("ComExecutor COM initialization failed") from self._init_error
 
     def stop(self, timeout: float = 5.0) -> None:
+        with self._lifecycle_lock:
+            self._stop(timeout)
+
+    def _stop(self, timeout: float) -> None:
         """Signal the worker to exit and wait for it to join.
 
         After ``stop()`` returns, no further ``submit()`` calls will be
@@ -133,13 +152,16 @@ class ComExecutor:
         if self._thread is None or not self._thread.is_alive():
             return
 
-        self._queue.put(_SHUTDOWN)
+        if not self._stopping:
+            self._stopping = True
+            self._queue.put(_SHUTDOWN)
         self._thread.join(timeout)
         if self._thread.is_alive():
             logger.warning(
                 f"ComExecutor worker '{self._name}' did not exit "
                 f"within {timeout}s; abandoning"
             )
+            return  # Keep the live thread handle: never start a second STA worker.
         self._thread = None
         self._stopped.set()
 
@@ -159,14 +181,14 @@ class ComExecutor:
         Raises:
             RuntimeError: Executor isn't running.
         """
-        if self._thread is None or not self._thread.is_alive():
-            raise RuntimeError(
-                f"ComExecutor '{self._name}' is not running; call start() first"
-            )
-
-        fut: Future[T] = Future()
-        self._queue.put((fn, fut))
-        return fut
+        with self._lifecycle_lock:
+            if self._thread is None or not self._thread.is_alive() or self._stopping:
+                raise RuntimeError(
+                    f"ComExecutor '{self._name}' is not running; call start() first"
+                )
+            fut: Future[T] = Future()
+            self._queue.put((fn, fut))
+            return fut
 
     def run(self, fn: Callable[[], T], timeout: float | None = None) -> T:
         """Run ``fn`` on the worker and block until the result is ready.
@@ -207,6 +229,7 @@ class ComExecutor:
         try:
             pythoncom.CoInitialize()
         except Exception as e:
+            self._init_error = e
             logger.error(
                 f"CoInitialize failed in ComExecutor worker '{self._name}': {e!r}"
             )
@@ -220,7 +243,13 @@ class ComExecutor:
 
         try:
             while True:
-                item = self._queue.get()
+                try:
+                    item = self._queue.get(timeout=0.05)
+                except queue.Empty:
+                    pump = getattr(pythoncom, "PumpWaitingMessages", None)
+                    if pump is not None:
+                        pump()
+                    continue
                 if item is _SHUTDOWN:
                     break
 

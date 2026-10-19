@@ -16,8 +16,11 @@ from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from loguru import logger
+
+from ..security.redaction import redact_credentials
 
 
 def _jsonable(value: Any) -> Any:
@@ -129,6 +132,67 @@ class PanelRuntime:
         self._operation_lock = asyncio.Lock()
         self._logs: deque[dict[str, Any]] = deque(maxlen=200)
         self._setup_error: str | None = None
+        self._call_task: asyncio.Task[Any] | None = None
+        self._call_id: str | None = None
+        self._completed: dict[str, tuple[float, dict[str, Any]]] = {}
+
+    def _archive_completed(self) -> None:
+        now = time.monotonic()
+        self._completed = {
+            key: value for key, value in self._completed.items()
+            if now - value[0] < 3600
+        }
+        if self._call_id and self._call_task is not None and self._call_task.done():
+            if self._call_id not in self._completed:
+                self._completed[self._call_id] = (now, self.operation_status(self._call_id))
+        while len(self._completed) > 200:
+            del self._completed[next(iter(self._completed))]
+
+    def _pending(self) -> dict[str, Any] | None:
+        if self._call_task is not None and not self._call_task.done():
+            return {
+                "ok": False, "status": "pending", "code": "SW_OPERATION_PENDING",
+                "operation_id": self._call_id, "retry_safe": False,
+                "error": "SolidWorks is still executing. Query operation status before submitting another operation.",
+            }
+        return None
+
+    def operation_status(self, operation_id: str) -> dict[str, Any]:
+        """Read the last submitted operation without scheduling more COM work."""
+        if operation_id != self._call_id or self._call_task is None:
+            archived = self._completed.get(operation_id)
+            if archived is not None and time.monotonic() - archived[0] < 3600:
+                return archived[1]
+            return {"ok": False, "status": "unknown", "operation_id": operation_id}
+        pending = self._pending()
+        if pending is not None:
+            return pending
+        try:
+            result = self._call_task.result()
+            structured = _jsonable(getattr(result, "structured_content", None))
+            if structured is None:
+                for block in getattr(result, "content", None) or []:
+                    if getattr(block, "type", None) == "text":
+                        try:
+                            decoded = json.loads(block.text)
+                        except (ValueError, TypeError):
+                            continue
+                        if isinstance(decoded, dict):
+                            structured = decoded
+                            break
+            business_status = structured.get("status") if isinstance(structured, dict) else None
+            is_error = bool(getattr(result, "is_error", False))
+            return {
+                "ok": not is_error and business_status not in {
+                    "failed", "error", "failure", "unsupported", "partial", "needs_confirmation",
+                },
+                "status": "completed", "operation_id": operation_id,
+                "result": structured,
+                "content": _jsonable(getattr(result, "content", None)),
+                "is_error": is_error,
+            }
+        except BaseException as exc:
+            return {"ok": False, "status": "failed", "operation_id": operation_id, "error": str(exc)}
 
     def attach_server(self, server: Any) -> None:
         """Attach an already-running MCP server when both services share a process."""
@@ -186,10 +250,14 @@ class PanelRuntime:
 
     async def close(self) -> None:
         """Disconnect the adapter without closing SolidWorks itself or user documents."""
+        if self._call_task is not None and not self._call_task.done():
+            await asyncio.gather(asyncio.shield(self._call_task), return_exceptions=True)
         if self.server is not None and self._owns_server:
             await self.server.stop()
-        self.server = None
-        self._owns_server = False
+            self.server = None
+            self._owns_server = False
+        # A shared server belongs to the stdio/API host. Keep its registry and
+        # sessions attached; the following health request can reconnect it.
 
     async def tools(self) -> list[dict[str, Any]]:
         server = await self.ensure_ready()
@@ -211,6 +279,8 @@ class PanelRuntime:
         confirmed: bool = False,
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
+        if pending := self._pending():
+            return pending
         server = await self.ensure_ready()
         definition = server.mcp.get_tool(name)
         if asyncio.iscoroutine(definition):
@@ -229,14 +299,23 @@ class PanelRuntime:
         started = time.perf_counter()
         record: dict[str, Any] = {
             "tool_name": name,
-            "arguments": _jsonable(arguments),
+            "arguments": redact_credentials(_jsonable(arguments)),
             "started_at": datetime.now().isoformat(timespec="milliseconds"),
         }
         async with self._operation_lock:
+            if pending := self._pending():
+                return pending
             try:
                 timeout = timeout_seconds or getattr(definition, "timeout", None) or 300.0
+                self._archive_completed()
+                self._call_id = f"panel_{uuid4().hex}"
+                self._call_task = asyncio.create_task(server.mcp.call_tool(name, arguments))
+                # Retrieve late errors even if the HTTP client goes away.
+                self._call_task.add_done_callback(
+                    lambda task: task.exception() if not task.cancelled() else None
+                )
                 result = await asyncio.wait_for(
-                    server.mcp.call_tool(name, arguments), timeout=float(timeout)
+                    asyncio.shield(self._call_task), timeout=float(timeout)
                 )
                 structured = _jsonable(getattr(result, "structured_content", None))
                 if structured is None:
@@ -267,6 +346,7 @@ class PanelRuntime:
                 ok = not is_error and operation_status not in incomplete_statuses
                 payload = {
                     "ok": ok,
+                    "operation_id": self._call_id,
                     "tool_name": name,
                     "status": operation_status,
                     "result": structured,
@@ -284,6 +364,10 @@ class PanelRuntime:
                 record.update({"ok": ok, "elapsed_ms": payload["elapsed_ms"]})
                 if not ok:
                     record["error"] = payload["error"]
+                return payload
+            except TimeoutError:
+                payload = self._pending() or self.operation_status(self._call_id or "")
+                record.update(payload)
                 return payload
             except Exception as exc:
                 payload = {
@@ -308,6 +392,8 @@ class PanelRuntime:
         # Starting is a recovery path. Do not attempt the normal attach first:
         # an unavailable application is expected here and must not consume a
         # circuit-breaker failure before the explicit launch is attempted.
+        if pending := self._pending():
+            return pending
         server = await self.ensure_ready(attach=False)
         adapter = getattr(server, "adapter", None)
         launcher = getattr(adapter, "start_solidworks", None)
@@ -365,6 +451,8 @@ class PanelRuntime:
                 return payload
 
     async def state(self) -> dict[str, Any]:
+        if pending := self._pending():
+            return {**pending, "connected": True, "status": "busy"}
         server = await self.ensure_ready()
         async with self._operation_lock:
             try:

@@ -36,6 +36,7 @@ from .agents.history_db import insert_tool_event
 from .cache.response_cache import CachePolicy, ResponseCache
 from .config import DeploymentMode, SolidWorksMCPConfig, load_config
 from .exceptions import SolidWorksMCPError
+from .security.redaction import redact_credentials
 
 AGENT_SYSTEM_PROMPT = (
     "You are a SolidWorks automation expert. You have access to comprehensive "
@@ -149,7 +150,7 @@ class SolidWorksMCPServer:
                 run_id=self._db_run_id,
                 tool_name=tool_name,
                 phase=phase,
-                payload_json=json.dumps(payload, ensure_ascii=True)
+                payload_json=json.dumps(redact_credentials(payload), ensure_ascii=True)
                 if payload is not None
                 else None,
                 db_path=(
@@ -182,7 +183,9 @@ class SolidWorksMCPServer:
             )
         )
         self._router = IntelligentRouter(analyzer=analyzer, cache=cache)
-        self._vba_adapter = VbaGeneratorAdapter(backing_adapter=self.adapter)
+        # Generated snippets are not an independent execution backend. Routing
+        # back into this adapter would recurse after instrumentation below.
+        self._vba_adapter = None
 
         if self.config.enable_intelligent_routing:
             self._instrument_adapter_methods()

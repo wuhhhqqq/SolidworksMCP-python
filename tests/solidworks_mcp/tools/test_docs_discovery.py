@@ -182,12 +182,12 @@ async def test_docs_discovery_import() -> None:
     reason="COM discovery only works on Windows",
 )
 @pytest.mark.windows_only
-async def test_docs_discovery_output_dir_creation() -> None:
+async def test_docs_discovery_output_dir_creation(tmp_path: Path) -> None:
     """Test that docs discovery creates output directory if it doesn't exist."""
     from solidworks_mcp.tools.docs_discovery import SolidWorksDocsDiscovery
 
     # Use a unique directory to avoid flaky pre-cleanup on Windows file locks.
-    test_dir = Path("tests/.generated") / f"docs-discovery-test-{time.time_ns()}"
+    test_dir = tmp_path / "docs-discovery"
 
     try:
         SolidWorksDocsDiscovery(output_dir=test_dir)

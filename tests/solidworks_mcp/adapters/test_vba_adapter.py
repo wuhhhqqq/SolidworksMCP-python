@@ -45,7 +45,7 @@ async def test_health_check_adds_vba_route() -> None:
     )
     adapter = VbaGeneratorAdapter(backing)
     result = await adapter.health_check()
-    assert result.metrics["route"] == "vba"
+    assert result.metrics["route"] == "com"
 
 
 def test_generate_sweep_and_loft_vba() -> None:

@@ -274,9 +274,9 @@ class TestAutomationExceptionPaths:
                 create=True,
                 new=AsyncMock(side_effect=RuntimeError("stop")),
             ):
-                # Just verify stop_macro_recording returns a success dict normally
+                # Legacy placeholder must report unsupported rather than fake success.
                 result = await fn({})
-                assert result["status"] == "success"
+                assert result["status"] == "unsupported"
 
     @pytest.mark.asyncio
     async def test_batch_process_files_exception(self):
@@ -569,5 +569,4 @@ class TestAnalysisCoverage:
 
         fn = await _get_tool(mcp, "get_material_properties")
         result = await fn()
-        assert result["status"] == "success"
-        assert "material" in result
+        assert result["status"] == "unsupported"

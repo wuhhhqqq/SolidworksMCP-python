@@ -184,7 +184,8 @@ async def test_vba_adapter_adds_route_metadata() -> None:
 
     assert result.is_success is True
     assert result.metadata is not None
-    assert result.metadata.get("route") == "vba"
+    assert result.metadata.get("route") == "com"
+    assert result.metadata.get("vba_executed") is False
     assert "vba_code" in result.metadata
 
 
@@ -256,7 +257,7 @@ async def test_server_runtime_instrumentation_caches_read_calls() -> None:
 
     assert first.is_success is True
     assert second.is_success is True
-    assert adapter.calls == 1
+    assert adapter.calls == 2
 
 
 def test_complexity_analyzer_recognizes_expanded_operations() -> None:

@@ -22,9 +22,10 @@ from solidworks_mcp.config import (
     SolidWorksMCPConfig,
 )
 from solidworks_mcp.contracts.mvp import (
-    AlignDrawingViewsRequest,
     ActivateConfigurationRequest,
     ActivateDocumentRequest,
+    ActivateDrawingSheetRequest,
+    ActivateDrawingViewRequest,
     Add3DLineRequest,
     AddArcRequest,
     AddCenterlineRequest,
@@ -34,14 +35,16 @@ from solidworks_mcp.contracts.mvp import (
     AddPointRequest,
     AddPolygonRequest,
     AddRectangleRequest,
-    AddSplineRequest,
     AddSketchTextRequest,
+    AddSplineRequest,
+    AlignDrawingViewsRequest,
     CheckAssemblyInterferenceRequest,
     CloseDocumentRequest,
     ConvertSketchEntitiesRequest,
     Create3DSketchRequest,
     CreateAssemblyMateRequest,
     CreateAssemblyRequest,
+    CreateAuxiliaryDrawingViewRequest,
     CreateChamferRequest,
     CreateConfigurationRequest,
     CreateCutExtrudeRequest,
@@ -50,21 +53,15 @@ from solidworks_mcp.contracts.mvp import (
     CreateDrawingBalloonRequest,
     CreateDrawingBomRequest,
     CreateDrawingHoleCalloutRequest,
-    CreateAuxiliaryDrawingViewRequest,
-    ActivateDrawingViewRequest,
-    ActivateDrawingSheetRequest,
-    CreateDrawingSheetRequest,
-    UpdateDrawingViewLayoutRequest,
-    DeleteDrawingSheetRequest,
     CreateDrawingNoteRequest,
-    CreateDrawingRevisionTableRequest,
     CreateDrawingRequest,
+    CreateDrawingRevisionTableRequest,
+    CreateDrawingSheetRequest,
     CreateDrawingViewRequest,
     CreateExtrusionRequest,
     CreateFeatureCircularPatternRequest,
     CreateFeatureLinearPatternRequest,
     CreateHoleWizardRequest,
-    CreateTappedHoleRequest,
     CreateLoftRequest,
     CreatePartRequest,
     CreateProjectedDrawingViewRequest,
@@ -72,7 +69,6 @@ from solidworks_mcp.contracts.mvp import (
     CreateRevolveRequest,
     CreateRibRequest,
     CreateSectionDrawingViewRequest,
-    ListDrawingSheetsRequest,
     CreateSheetMetalBaseFlangeRequest,
     CreateSheetMetalEdgeFlangeRequest,
     CreateShellRequest,
@@ -80,12 +76,14 @@ from solidworks_mcp.contracts.mvp import (
     CreateSketchLinearPatternRequest,
     CreateSketchRequest,
     CreateSweepRequest,
+    CreateTappedHoleRequest,
     CreateThickenRequest,
     CreateWrapRequest,
     DeleteAssemblyMateRequest,
     DeleteConfigurationRequest,
     DeleteCustomPropertyRequest,
     DeleteDrawingBomRequest,
+    DeleteDrawingSheetRequest,
     DeleteEquationRequest,
     DocumentRequest,
     ExecuteTrustedMacroRequest,
@@ -95,8 +93,8 @@ from solidworks_mcp.contracts.mvp import (
     GetAssemblyComponentRequest,
     GetBoundingBoxRequest,
     GetConfigurationRequest,
-    GetDrawingViewOutlineRequest,
     GetDimensionRequest,
+    GetDrawingViewOutlineRequest,
     GetEquationRequest,
     GetFeatureDimensionRequest,
     GetMaterialAssignmentRequest,
@@ -110,9 +108,10 @@ from solidworks_mcp.contracts.mvp import (
     ListAssemblyMatesRequest,
     ListConfigurationsRequest,
     ListCustomPropertiesRequest,
-    ListDrawingAnnotationTargetsRequest,
-    ListDrawingViewsRequest,
     ListDimensionsRequest,
+    ListDrawingAnnotationTargetsRequest,
+    ListDrawingSheetsRequest,
+    ListDrawingViewsRequest,
     ListEquationsRequest,
     ListFeaturesRequest,
     ListPartTopologyRequest,
@@ -138,6 +137,7 @@ from solidworks_mcp.contracts.mvp import (
     SheetMetalFlatStateRequest,
     TrimSketchEntityRequest,
     UpdateDrawingBomRequest,
+    UpdateDrawingViewLayoutRequest,
 )
 from solidworks_mcp.server import SolidWorksMCPServer
 
@@ -213,10 +213,9 @@ async def real_server() -> AsyncGenerator[SolidWorksMCPServer, None]:
 
 
 @pytest_asyncio.fixture
-async def output_dir() -> Path:
+async def output_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Test helper for output dir."""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    return OUTPUT_DIR
+    return tmp_path_factory.mktemp("endpoint_reports")
 
 
 def _load_catalog() -> list[dict[str, Any]]:

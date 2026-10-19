@@ -30,6 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
+from ..security.redaction import redact_credentials
 from .routers import checkpoint as checkpoint_router
 from .routers import docs as docs_router
 from .routers import llm as llm_router
@@ -258,8 +259,8 @@ async def log_ui_requests(request: Request, call_next):
     payload = {
         "method": request.method,
         "path": request.url.path,
-        "query": dict(request.query_params),
-        "body": _decode_request_body(raw_body),
+        "query": redact_credentials(dict(request.query_params)),
+        "body": redact_credentials(_decode_request_body(raw_body)),
     }
 
     logger.info(

@@ -493,9 +493,10 @@ async def register_file_management_tools(
 
     def _copy_active_assembly_with_references(  # pragma: no cover
         target_assembly_path: str,
+        native_adapter: Any = None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Copy active assembly and resolved dependencies into target folder."""
-        current_model = getattr(adapter, "currentModel", None)
+        current_model = getattr(native_adapter if native_adapter is not None else adapter, "currentModel", None)
         if current_model is None:
             return None, {
                 "status": "error",
@@ -565,9 +566,10 @@ async def register_file_management_tools(
 
     def _native_pack_and_go(  # pragma: no cover
         target_assembly_path: str,
+        native_adapter: Any = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
         """Try documented Pack-and-Go COM flow before fallback copy logic."""
-        current_model = getattr(adapter, "currentModel", None)
+        current_model = getattr(native_adapter if native_adapter is not None else adapter, "currentModel", None)
         if current_model is None:
             return None, "No active model available for Pack and Go."
 
@@ -1410,13 +1412,22 @@ async def register_file_management_tools(
                 )  # validation_error being None implies file_path is valid
 
                 if input_data.include_references:
-                    native_result, native_error = _native_pack_and_go(file_path)
+                    run_native = getattr(adapter, "run_native", None)
+                    if callable(run_native):
+                        native_result, native_error = await run_native(
+                            lambda native: _native_pack_and_go(file_path, native)
+                        )
+                    else:
+                        native_result, native_error = _native_pack_and_go(file_path)
                     if native_result is not None:  # pragma: no cover
                         return native_result
 
-                    copied_result, copy_error = _copy_active_assembly_with_references(
-                        file_path
-                    )  # pragma: no cover
+                    if callable(run_native):
+                        copied_result, copy_error = await run_native(
+                            lambda native: _copy_active_assembly_with_references(file_path, native)
+                        )
+                    else:
+                        copied_result, copy_error = _copy_active_assembly_with_references(file_path)
                     if copy_error is not None:  # pragma: no cover
                         return copy_error  # pragma: no cover
                     assert copied_result is not None  # pragma: no cover

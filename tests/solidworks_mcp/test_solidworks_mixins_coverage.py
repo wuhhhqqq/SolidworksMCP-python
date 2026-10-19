@@ -63,10 +63,10 @@ class TestSolidWorksFeaturesMixinSweepLoft:
 
     @pytest.mark.asyncio
     async def test_create_loft_returns_error(self, monkeypatch) -> None:
-        """create_loft is a stub that always returns ERROR."""
+        """Loft rejects fewer than two profiles before touching COM."""
         adapter = _build_adapter(monkeypatch)
         adapter.currentModel = MagicMock()
-        params = SimpleNamespace(profiles=["Sketch1", "Sketch2"])
+        params = SimpleNamespace(profiles=["Sketch1"])
         result = await adapter.create_loft(params)
         assert result.is_error
         assert result.error is not None
@@ -145,9 +145,13 @@ class TestSolidWorksIOMixinNotConnected:
             def GetName() -> str:
                 return "Default"
 
-        model = MagicMock()
+        model = MagicMock(spec=["GetActiveConfiguration", "GetSaveTime", "GetPathName", "GetTitle"])
         model.GetActiveConfiguration.return_value = _Cfg()
-        app = MagicMock()
+        model.GetSaveTime.return_value = 0
+        model.GetPathName.return_value = "model.sldprt"
+        app = MagicMock(spec=["OpenDoc6", "GetDocuments", "ActiveDoc"])
+        app.GetDocuments.return_value = ()
+        app.ActiveDoc = None
         app.OpenDoc6.return_value = model
 
         adapter.swApp = app

@@ -287,8 +287,8 @@ class TestInsertError:
     def test_without_run_id(self, tmp_path: Path):
         """Test without run id."""
 
-        _db(tmp_path)
-        insert_error(self._record())  # uses default DB path — monkeypatched below
+        db = _db(tmp_path)
+        insert_error(self._record(), db_path=db)
         # Just verify no exception is raised (uses default path in real run)
 
     def test_multiple_errors(self, tmp_path: Path):

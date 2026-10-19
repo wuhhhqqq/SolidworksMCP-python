@@ -152,6 +152,10 @@ class AdapterFactory:
             base_adapter = adapter_class(adapter_config)  # type: ignore[assignment]
 
         # Wrap with additional features if enabled
+        if adapter_type != AdapterType.MOCK:
+            from .sta_adapter import StaAdapter
+
+            base_adapter = StaAdapter(base_adapter)
         adapter: SolidWorksAdapter = base_adapter  # type: ignore[assignment]
 
         # Keep mock/testing adapters simple and deterministic.

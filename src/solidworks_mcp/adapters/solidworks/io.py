@@ -1728,10 +1728,13 @@ class SolidWorksIOMixin:
                 raise RuntimeError(
                     "SolidWorks did not report a document title to close"
                 )
-            app.CloseDoc(title)
+            # Cache the path before CloseDoc: SolidWorks disconnects the
+            # IModelDoc2 dispatch immediately, and even GetPathName can raise
+            # RPC_E_DISCONNECTED after the document is closed.
             model_path = adapter._attempt(
                 lambda: self._read_com_member(model, "GetPathName"), default=None
             )
+            app.CloseDoc(title)
             if isinstance(model_path, str) and model_path:
                 _OPEN_DOCUMENT_CACHE.pop(
                     os.path.normcase(os.path.abspath(model_path)), None

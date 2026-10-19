@@ -45,6 +45,7 @@ async def register_capability_tools(mcp: FastMCP, adapter: Any, config: Any) -> 
             tool.name for tool in await mcp.list_tools() if tool.name.startswith("solidworks_")
         )
         return {
+            "status": "success",
             "server": {"version": __version__, "build_id": getattr(config, "build_id", None)},
             "backend": {
                 "adapter_type": adapter_type,

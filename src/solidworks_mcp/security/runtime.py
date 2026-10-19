@@ -82,7 +82,7 @@ class SecurityEnforcer:
         if provided_key is None:
             raise SecurityError("authentication required but api_key was not provided")
 
-        if not validate_api_key(provided_key=provided_key, expected_key=expected_key):
+        if not self.accepts_key(provided_key):
             raise SecurityError("authentication failed: invalid api_key")
 
     def _extract_context(self, payload: object) -> SecurityContext:
@@ -140,6 +140,17 @@ class SecurityEnforcer:
         if api_keys:
             return cast("str | None", api_keys[0])
         return None
+
+    def accepts_key(self, provided_key: str) -> bool:
+        """Accept any configured key, using constant-time comparisons."""
+        keys = list(getattr(self._config, "api_keys", []) or [])
+        configured_key = getattr(self._config, "api_key", None)
+        if configured_key is not None:
+            get_secret_value = getattr(configured_key, "get_secret_value", None)
+            keys.append(
+                get_secret_value() if callable(get_secret_value) else str(configured_key)
+            )
+        return any(validate_api_key(provided_key, str(key)) for key in keys)
 
 
 def constant_time_equals(left: str, right: str) -> bool:

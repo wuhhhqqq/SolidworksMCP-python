@@ -2,12 +2,58 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
 from fastmcp import FastMCP
 
 from solidworks_mcp.ui.panel_runtime import PanelRuntime, serialize_tool
+
+
+@pytest.mark.asyncio
+async def test_timeout_is_pending_and_cannot_duplicate_mutation():
+    mcp = FastMCP("pending")
+    release = asyncio.Event()
+    calls = []
+
+    @mcp.tool()
+    async def mutate() -> dict:
+        calls.append(1)
+        await release.wait()
+        return {"status": "succeeded"}
+
+    runtime = PanelRuntime()
+    runtime.server = SimpleNamespace(
+        _setup_complete=True, mcp=mcp, state=SimpleNamespace(is_connected=True),
+    )
+    first = await runtime.execute("mutate", {}, timeout_seconds=0.01)
+    assert first["status"] == "pending"
+    assert not first["retry_safe"]
+    assert (await runtime.execute("mutate", {}))["operation_id"] == first["operation_id"]
+    assert (await runtime.state())["status"] == "busy"
+    release.set()
+    await runtime._call_task
+    completed = runtime.operation_status(first["operation_id"])
+    assert completed["status"] == "completed"
+    assert completed["result"]["status"] == "succeeded"
+    assert calls == [1]
+
+
+def test_polling_reads_business_failure_from_text_content():
+    from concurrent.futures import Future
+
+    task = Future()
+    task.set_result(SimpleNamespace(
+        structured_content=None, is_error=False,
+        content=[SimpleNamespace(type="text", text='{"status":"failed"}')],
+    ))
+    runtime = PanelRuntime()
+    runtime._call_task = task
+    runtime._call_id = "late"
+    result = runtime.operation_status("late")
+    assert result["ok"] is False
+    assert result["result"]["status"] == "failed"
 
 
 @pytest.mark.asyncio

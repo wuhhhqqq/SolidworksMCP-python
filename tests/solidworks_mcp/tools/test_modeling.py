@@ -354,6 +354,7 @@ class TestModelingTools:
         assert result == {
             "status": "success",
             "message": "Created chamfer: Chamfer1",
+            "hint": "For new calls, list current part topology and use solidworks_create_chamfer with opaque edge_ids.",
             "chamfer": {
                 "name": "Chamfer1",
                 "distance": 1.5,

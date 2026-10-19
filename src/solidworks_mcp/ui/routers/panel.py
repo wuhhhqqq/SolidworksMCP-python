@@ -101,6 +101,13 @@ async def panel_logs(
     return {"logs": get_panel_runtime().logs(limit)}
 
 
+@router.get("/api/panel/operations/{operation_id}")
+async def panel_operation(operation_id: str, request: Request) -> dict[str, Any]:
+    """Poll completion after a soft timeout without retrying the CAD mutation."""
+    _require_local(request)
+    return get_panel_runtime().operation_status(operation_id)
+
+
 @router.post("/api/panel/reconnect")
 async def panel_reconnect(request: Request) -> dict[str, Any]:
     _require_local(request)

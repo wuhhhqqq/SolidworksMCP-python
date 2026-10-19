@@ -33,6 +33,8 @@ def _base_config(**overrides):
         "enable_circuit_breaker": False,
         "enable_connection_pooling": False,
         "solidworks_path": "mock://solidworks",
+        "solidworks_year": 2019,
+        "solidworks_startup_timeout_seconds": 120,
         "enable_windows_validation": False,
         "debug": False,
         "circuit_breaker_threshold": 2,
@@ -75,6 +77,9 @@ def test_create_adapter_vba_uses_backing_adapter_with_built_config(monkeypatch) 
 
     adapter = factory._create_adapter_impl(_base_config(adapter_type=AdapterType.VBA))
 
+    from solidworks_mcp.adapters.sta_adapter import StaAdapter
+    assert isinstance(adapter, StaAdapter)
+    adapter = adapter.adapter
     assert isinstance(adapter, VbaGeneratorAdapter)
     assert isinstance(adapter._backing_adapter, _DummyAdapter)
     assert adapter._backing_adapter.config["solidworks_path"] == "mock://solidworks"
@@ -100,6 +105,9 @@ def test_create_adapter_vba_uses_mock_backing_with_raw_config(monkeypatch) -> No
     cfg = _base_config(adapter_type=AdapterType.VBA)
     adapter = factory._create_adapter_impl(cfg)
 
+    from solidworks_mcp.adapters.sta_adapter import StaAdapter
+    assert isinstance(adapter, StaAdapter)
+    adapter = adapter.adapter
     assert isinstance(adapter, VbaGeneratorAdapter)
     assert isinstance(adapter._backing_adapter, _DummyAdapter)
     assert adapter._backing_adapter.config is cfg
