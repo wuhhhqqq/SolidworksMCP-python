@@ -21,7 +21,7 @@ async def test_protocol_modeling_and_artifact_workflow(tmp_path: Path) -> None:
     try:
         async with Client(server) as client:
             tools = {tool.name: tool for tool in await client.list_tools()}
-            assert len(tools) == 134
+            assert len(tools) == 135
             assert tools["solidworks_add_rectangle"].inputSchema
 
             async def call(name: str, payload: dict | None = None) -> dict:

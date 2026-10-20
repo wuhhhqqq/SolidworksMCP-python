@@ -135,6 +135,7 @@ from ..contracts.mvp import (
     SetEquationRequest,
     SetFeatureDimensionRequest,
     SetMaterialAssignmentRequest,
+    StartSolidWorksRequest,
     SetSheetMetalKFactorRequest,
     SheetMetalFlatStateRequest,
     SplitSketchEntityRequest,
@@ -202,6 +203,22 @@ async def register_mvp_tools(mcp: FastMCP, adapter: Any, config: Any) -> int:
     async def solidworks_create_session() -> OperationResult:
         """Create an opaque workflow session and report SolidWorks connection health."""
         return await workflow.create_session()
+
+    @mcp.tool(
+        name="solidworks_start",
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+    )
+    async def solidworks_start(
+        input_data: StartSolidWorksRequest | None = None,
+    ) -> OperationResult:
+        """Explicitly start SolidWorks and wait for its COM server to become ready."""
+        request = input_data or StartSolidWorksRequest()
+        return await workflow.start_solidworks(request.timeout_seconds)
 
     @mcp.tool(
         name="solidworks_close_session",

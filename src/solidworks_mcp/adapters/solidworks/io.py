@@ -273,11 +273,20 @@ class SolidWorksIOMixin:
 
     @classmethod
     def _equation_manager(cls, adapter: Any) -> Any:
-        """Return a flagged equation manager or raise a focused COM error."""
+        """Return a flagged equation manager across early/late COM bindings."""
         getter = getattr(adapter.currentModel, "GetEquationMgr", None)
-        if not callable(getter):
+        if getter is None:
             raise RuntimeError("Active part does not support the equation manager")
-        manager = getter()
+        # CDispatch may return the manager itself from getattr; COM dispatches
+        # are callable, so calling that value invokes its default member rather
+        # than GetEquationMgr. A real method wrapper lacks IEquationMgr members.
+        manager = (
+            getter
+            if getattr(getter, "GetCount", None) is not None
+            else getter()
+            if callable(getter)
+            else None
+        )
         if manager is None:
             raise RuntimeError("SolidWorks did not return an equation manager")
         _sw_type_info.flag_methods(manager, "IEquationMgr")
@@ -1778,9 +1787,89 @@ class SolidWorksIOMixin:
                 lambda: adapter._get_attr_or_call(app, "ActiveDoc"), default=None
             )
 
+            def _open_documents() -> list[Any] | None:
+                """Read currently open documents when this SW version supports it."""
+                if getattr(app, "GetDocuments", None) is None:
+                    return None
+                enumeration_failed = object()
+                raw_documents = adapter._attempt(
+                    lambda: adapter._get_attr_or_call(app, "GetDocuments"),
+                    default=enumeration_failed,
+                )
+                if raw_documents is enumeration_failed:
+                    return None
+                if raw_documents is None:
+                    # SolidWorks returns a null SAFEARRAY when no documents are open.
+                    return []
+                if isinstance(raw_documents, (list, tuple)):
+                    return [
+                        document
+                        for document in raw_documents
+                        if document is not None
+                    ]
+                if isinstance(raw_documents, (str, bytes)):
+                    return None
+                try:
+                    return [
+                        document
+                        for document in raw_documents
+                        if document is not None
+                    ]
+                except TypeError:
+                    return [raw_documents]
+
+            documents_before = _open_documents()
+
+            def _document_identity(document: Any) -> tuple[str, str]:
+                """Identify a document across separately marshalled COM wrappers."""
+                document_path = adapter._attempt(
+                    lambda: adapter._get_attr_or_call(document, "GetPathName"),
+                    default="",
+                )
+                normalized_path = (
+                    os.path.normcase(os.path.abspath(document_path))
+                    if isinstance(document_path, str) and document_path
+                    else ""
+                )
+                return normalized_path, self._read_model_title(document)
+
             new_part = getattr(app, "NewPart", None)
+            new_part_called = callable(new_part)
             if callable(new_part):
                 model = adapter._attempt(new_part)
+
+            # Some legacy COM bindings return a null IDispatch and leave
+            # ActiveDoc unchanged even though the new part is already open.
+            # Claim the unique new Part from GetDocuments before considering
+            # any fallback that would create another document.
+            if model is None and documents_before is not None:
+                documents_after = _open_documents()
+                if documents_after is not None:
+                    previous_identities = {
+                        _document_identity(document)
+                        for document in documents_before
+                    }
+                    new_documents = [
+                        document
+                        for document in documents_after
+                        if _document_identity(document) not in previous_identities
+                        and not any(
+                            _same_com_reference(document, previous)
+                            for previous in documents_before
+                        )
+                    ]
+                    typed_new_documents = [
+                        document
+                        for document in new_documents
+                        if adapter._attempt(
+                            lambda document=document: adapter._get_attr_or_call(
+                                document, "GetType"
+                            ),
+                            default=None,
+                        ) == 1
+                    ]
+                    if len(typed_new_documents) == 1:
+                        model = typed_new_documents[0]
 
             # SW 2019 can activate the document but return a null IDispatch
             # from NewPart.  Use the verified active Part before trying the
@@ -1791,6 +1880,12 @@ class SolidWorksIOMixin:
                 )
 
             if model is None:
+                if new_part_called:
+                    raise Exception(
+                        "NewPart returned no document and SolidWorks did not expose "
+                        "a uniquely identifiable new part; refusing to create a "
+                        "duplicate"
+                    )
                 part_template = self._resolve_template_path([8, 0, 1, 2, 3], ".prtdot")
                 if not part_template:
                     raise Exception("No part template configured in SolidWorks")
@@ -5838,28 +5933,46 @@ class SolidWorksIOMixin:
             existing = self._find_equation_row(
                 self._equation_rows(adapter, manager), name
             )
-            if existing is None:
+            original_assignment = None
+            if existing is not None:
+                # SetEquationAndConfigurationOption is unavailable or a
+                # no-op in some supported SolidWorks type-library bindings.
+                # Delete + Add2(Solve=True) is the reliable update path and
+                # performs the solve as part of adding the replacement.
+                original_assignment = manager.Equation(int(existing["index"]))
+            try:
+                if existing is not None:
+                    manager.Delete(int(existing["index"]))
                 manager.Add2(-1, assignment, True)
-            else:
-                update_result = manager.SetEquationAndConfigurationOption(
-                    int(existing["index"]), assignment, 2, None
+                verified = self._find_equation_row(
+                    self._equation_rows(adapter, manager), name
                 )
-                if update_result != 0:
-                    raise RuntimeError("SolidWorks rejected the equation update")
-            evaluator = getattr(manager, "EvaluateAll", None)
-            if not callable(evaluator):
-                raise RuntimeError("SolidWorks does not support equation evaluation")
-            if evaluator() != 0:
-                raise RuntimeError("SolidWorks failed to evaluate the equation")
-            verified = self._find_equation_row(
-                self._equation_rows(adapter, manager), name
-            )
-            if verified is None:
-                raise RuntimeError("SolidWorks did not retain the equation write")
-            if verified["expression"] != expression:
-                raise RuntimeError(
-                    "SolidWorks did not retain the requested equation expression"
-                )
+                if verified is None:
+                    raise RuntimeError("SolidWorks did not retain the equation write")
+                if verified["expression"] != expression:
+                    raise RuntimeError(
+                        "SolidWorks did not retain the requested equation expression"
+                    )
+            except Exception:
+                if existing is not None:
+                    try:
+                        current = self._find_equation_row(
+                            self._equation_rows(adapter, manager), name
+                        )
+                        if current != existing:
+                            if current is not None:
+                                manager.Delete(int(current["index"]))
+                            manager.Add2(int(existing["index"]), original_assignment, True)
+                        restored = self._find_equation_row(
+                            self._equation_rows(adapter, manager), name
+                        )
+                        if restored != existing:
+                            raise RuntimeError("Original equation was not restored")
+                    except Exception as rollback_error:
+                        raise RuntimeError(
+                            "Equation update failed and the original equation could not be restored"
+                        ) from rollback_error
+                raise
             return verified
 
         return cast(

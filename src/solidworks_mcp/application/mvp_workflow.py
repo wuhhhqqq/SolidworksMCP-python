@@ -276,9 +276,52 @@ class MvpWorkflow:
             if health is not None
             else {"healthy": connected, "connection_status": "unknown"}
         )
+        warnings = []
+        if not connected:
+            warnings.append(
+                "The workflow session was created, but SolidWorks is disconnected. "
+                "Start SolidWorks and create a new session before using modeling tools."
+            )
         return OperationResult.succeeded(
             route=OperationRoute.NONE,
             data={"session": session.ref.model_dump(), "health": health_payload},
+            warnings=warnings,
+        )
+
+    async def start_solidworks(
+        self, timeout_seconds: float | None = None
+    ) -> OperationResult:
+        """Explicitly launch SolidWorks and report when its COM server is ready."""
+        starter = getattr(self.adapter, "start_solidworks", None)
+        if not callable(starter):
+            return OperationResult.failed(
+                code="SW_START_UNSUPPORTED",
+                message="The configured SolidWorks adapter cannot launch SolidWorks.",
+                suggestion="Use an adapter with explicit SolidWorks startup support.",
+            )
+        try:
+            async with self._adapter_lock:
+                result = await starter(timeout_seconds)
+        except Exception:
+            logger.exception("Explicit SolidWorks startup failed")
+            return OperationResult.failed(
+                code="SW_START_FAILED",
+                message="SolidWorks could not be started or did not become ready.",
+                suggestion=(
+                    "Check the SolidWorks installation and startup dialogs, then retry "
+                    "with a longer timeout."
+                ),
+            )
+        payload = self._as_dict(result)
+        if not self.adapter.is_connected() or payload.get("connected") is False:
+            return OperationResult.failed(
+                code="SW_START_FAILED",
+                message="SolidWorks startup returned before a usable connection was ready.",
+                suggestion="Wait for SolidWorks to finish starting, then retry.",
+            )
+        return OperationResult.succeeded(
+            route=OperationRoute.NONE,
+            data={"startup": payload, "health": self._as_dict(await self._health_check())},
         )
 
     async def close_session(self, session_id: str) -> OperationResult:
@@ -5468,12 +5511,16 @@ class MvpWorkflow:
         session: Any | None = None,
     ) -> Any:
         """Normalize adapter failures into safe MCP errors."""
+        if not self.adapter.is_connected():
+            return self._not_connected(operation_id)
         try:
             async with self._adapter_lock:
                 if session is not None and self._foreign_sketch_context_locked(session):
                     return self._sketch_context_locked()
                 result = await call()
         except Exception:
+            if not self.adapter.is_connected():
+                return self._not_connected(operation_id)
             return OperationResult.failed(
                 operation_id=operation_id,
                 code="SW_ADAPTER_EXCEPTION",
@@ -5481,6 +5528,8 @@ class MvpWorkflow:
                 suggestion="Verify the active document state and retry the operation.",
             )
         if not getattr(result, "is_success", False):
+            if not self.adapter.is_connected():
+                return self._not_connected(operation_id)
             logger.debug(
                 "SolidWorks adapter operation failed: {}",
                 getattr(result, "error", "unknown adapter failure"),
@@ -5504,6 +5553,8 @@ class MvpWorkflow:
         pre_call: Any | None = None,
     ) -> Any:
         """Activate the tracked COM document and run one operation without interleaving."""
+        if not self.adapter.is_connected():
+            return self._not_connected(operation_id)
         if self._foreign_sketch_context_locked(session):
             return self._sketch_context_locked()
         try:
@@ -5532,6 +5583,8 @@ class MvpWorkflow:
                 if getattr(result, "is_success", False) and on_success is not None:
                     on_success(result)
         except Exception:
+            if not self.adapter.is_connected():
+                return self._not_connected(operation_id)
             return OperationResult.failed(
                 operation_id=operation_id,
                 code="SW_ADAPTER_EXCEPTION",
@@ -5539,6 +5592,8 @@ class MvpWorkflow:
                 suggestion="Verify the active document state and retry the operation.",
             )
         if not getattr(result, "is_success", False):
+            if not self.adapter.is_connected():
+                return self._not_connected(operation_id)
             adapter_error_code = (getattr(result, "metadata", None) or {}).get(
                 "error_code"
             )
@@ -5590,6 +5645,19 @@ class MvpWorkflow:
                 suggestion="Check the active document state and retry the operation.",
             )
         return result
+
+    @staticmethod
+    def _not_connected(operation_id: str | None = None) -> OperationResult:
+        """Return a stable actionable error when SolidWorks is unavailable."""
+        return OperationResult.failed(
+            operation_id=operation_id,
+            code="SW_NOT_CONNECTED",
+            message="The MCP server is not connected to a running SolidWorks instance.",
+            suggestion=(
+                "Start SolidWorks from the desktop shortcut, wait for it to finish "
+                "starting, then create a new workflow session."
+            ),
+        )
 
     def _foreign_sketch_context_locked(self, session: Any) -> bool:
         """Prevent another session from changing SolidWorks while sketch edit mode is open."""

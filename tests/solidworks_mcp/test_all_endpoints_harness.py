@@ -664,6 +664,7 @@ _SMOKE_PAYLOADS: dict[str, dict[str, Any]] = {
 
 MVP_TOOL_NAMES = {
     "solidworks_create_session",
+    "solidworks_start",
     "solidworks_close_session",
     "solidworks_get_status",
     "solidworks_list_documents",

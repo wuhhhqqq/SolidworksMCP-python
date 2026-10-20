@@ -182,6 +182,11 @@ creation/listing operation.
 
 ## Geometry and parametrics
 
+Use `solidworks_start` to explicitly launch SolidWorks and wait for its COM
+server to become ready. The optional `timeout_seconds` is capped at 300 seconds.
+This does not run automatically when the MCP server starts; call it when
+SolidWorks is not already available, then create a workflow session.
+
 `solidworks_get_bounding_box` reads an active part's axis-aligned extents using
 `IPartDoc::GetPartBox`. It returns `min_point_mm`, `max_point_mm`, and
 `size_mm`; clients never receive the underlying COM array.

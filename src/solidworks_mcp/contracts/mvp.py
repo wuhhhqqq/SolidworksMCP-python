@@ -505,6 +505,12 @@ class SessionRequest(StrictContract):
     session_id: str = Field(min_length=1, max_length=128)
 
 
+class StartSolidWorksRequest(StrictContract):
+    """Explicitly start SolidWorks with an optional bounded readiness timeout."""
+
+    timeout_seconds: float | None = Field(default=None, gt=0, le=300)
+
+
 class DocumentRequest(SessionRequest):
     """Base input for operations scoped to a session document."""
 

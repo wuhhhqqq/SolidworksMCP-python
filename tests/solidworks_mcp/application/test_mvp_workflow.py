@@ -209,7 +209,6 @@ class WorkflowAdapter:
             average_response_time=0.01,
             connection_status="connected",
         )
-
     async def create_part(
         self, name: str, units: str
     ) -> AdapterResult[SolidWorksModel]:
@@ -994,6 +993,65 @@ class RejectingOpenWorkflowAdapter(WorkflowAdapter):
             status=AdapterResultStatus.ERROR,
             error=f"COM error opening {file_path}: C:\\private\\designs\\secret.sldprt",
         )
+
+
+@pytest.mark.asyncio
+async def test_create_session_warns_when_solidworks_is_disconnected(
+    tmp_path: Path,
+) -> None:
+    """Session creation succeeds but clearly reports the unavailable CAD app."""
+    adapter = WorkflowAdapter()
+    adapter.is_connected = lambda: False  # type: ignore[method-assign]
+    workflow = MvpWorkflow(adapter=adapter, artifact_store=ArtifactStore(tmp_path))
+
+    result = await workflow.create_session()
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert result.data["session"]["connected"] is False
+    assert result.warnings
+    assert "SolidWorks is disconnected" in result.warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_model_operation_returns_not_connected_when_solidworks_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    """An unavailable app is reported before an adapter operation is attempted."""
+    adapter = WorkflowAdapter()
+    adapter.is_connected = lambda: False  # type: ignore[method-assign]
+    workflow = MvpWorkflow(adapter=adapter, artifact_store=ArtifactStore(tmp_path))
+    session = await workflow.create_session()
+
+    result = await workflow.create_part(
+        CreatePartRequest(
+            session_id=session.data["session"]["session_id"], name="Unavailable"
+        )
+    )
+
+    assert result.status is OperationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == "SW_NOT_CONNECTED"
+    assert adapter.active_model_name is None
+
+
+@pytest.mark.asyncio
+async def test_start_solidworks_uses_explicit_adapter_launcher(tmp_path: Path) -> None:
+    """The workflow exposes the adapter's safe launch-and-attach operation."""
+    adapter = WorkflowAdapter()
+    adapter.start_solidworks = (  # type: ignore[attr-defined]
+        lambda _timeout: _started_solidworks_result()
+    )
+    workflow = MvpWorkflow(adapter=adapter, artifact_store=ArtifactStore(tmp_path))
+
+    result = await workflow.start_solidworks(45)
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert result.data["startup"]["connected"] is True
+    assert result.data["startup"]["started"] is True
+
+
+async def _started_solidworks_result() -> dict[str, object]:
+    return {"started": True, "already_running": False, "connected": True}
 
 
 @pytest.fixture

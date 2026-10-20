@@ -25,10 +25,11 @@ async def test_mvp_tools_are_prefixed_and_expose_structured_session_creation(
     config = SimpleNamespace(data_dir=tmp_path)
     added = await register_mvp_tools(mcp_server, _Adapter(), config)
 
-    assert added == 134
+    assert added == 135
     tools = {tool.name: tool for tool in await mcp_server.list_tools()}
     expected = {
         "solidworks_create_session",
+        "solidworks_start",
         "solidworks_close_session",
         "solidworks_get_status",
         "solidworks_list_documents",

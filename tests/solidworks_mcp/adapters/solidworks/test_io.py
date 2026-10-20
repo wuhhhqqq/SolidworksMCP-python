@@ -103,6 +103,94 @@ async def test_create_part_uses_verified_active_document_when_new_part_returns_n
 
 
 @pytest.mark.asyncio
+async def test_create_part_uses_document_delta_before_template_fallback() -> None:
+    """A newly opened part can be identified even if ActiveDoc stays stale."""
+    previous_model = SimpleNamespace(
+        GetTitle=Mock(return_value="ExistingPart"), GetType=Mock(return_value=1)
+    )
+    new_model = SimpleNamespace(
+        GetTitle=Mock(return_value="Part2"), GetType=Mock(return_value=1)
+    )
+    documents = [previous_model]
+    app = SimpleNamespace(
+        ActiveDoc=previous_model,
+        GetDocuments=Mock(side_effect=lambda: tuple(documents)),
+    )
+
+    def create_part_without_dispatch():
+        documents.append(new_model)
+        return None
+
+    app.NewPart = Mock(side_effect=create_part_without_dispatch)
+    app.NewDocument = Mock(side_effect=AssertionError("must not create a duplicate"))
+    harness = _CreationHarness(app)
+
+    result = await harness.create_part()
+
+    assert result.is_success
+    assert result.data.name == "Part2"
+    assert harness.currentModel is new_model
+    app.NewDocument.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_part_treats_null_document_list_as_empty() -> None:
+    """A null SAFEARRAY means no open documents, not unsupported enumeration."""
+    new_model = SimpleNamespace(
+        GetTitle=Mock(return_value="Part1"), GetType=Mock(return_value=1)
+    )
+    documents = []
+    app = SimpleNamespace(
+        ActiveDoc=None,
+        GetDocuments=Mock(side_effect=lambda: tuple(documents) if documents else None),
+    )
+
+    def create_part_without_dispatch():
+        documents.append(new_model)
+        return None
+
+    app.NewPart = Mock(side_effect=create_part_without_dispatch)
+    app.NewDocument = Mock(side_effect=AssertionError("must not create a duplicate"))
+    harness = _CreationHarness(app)
+
+    result = await harness.create_part()
+
+    assert result.is_success
+    assert result.data.name == "Part1"
+    assert harness.currentModel is new_model
+    assert harness.tracked_documents == [new_model]
+    app.NewDocument.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_part_fails_safely_when_null_new_part_cannot_be_identified(
+    monkeypatch,
+) -> None:
+    """Do not risk a duplicate when NewPart may have created an unseen document."""
+    previous_model = SimpleNamespace(
+        GetTitle=Mock(return_value="ExistingPart"), GetType=Mock(return_value=1)
+    )
+    app = SimpleNamespace(
+        ActiveDoc=previous_model,
+        GetDocuments=Mock(return_value=(previous_model,)),
+        NewPart=Mock(return_value=None),
+        NewDocument=Mock(),
+    )
+    monkeypatch.setattr(
+        SolidWorksIOMixin,
+        "_resolve_template_path",
+        Mock(side_effect=AssertionError("must not create a duplicate")),
+    )
+    harness = _CreationHarness(app)
+
+    result = await harness.create_part()
+
+    assert not result.is_success
+    assert "refusing to create a duplicate" in result.error
+    app.NewDocument.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_create_part_preserves_localized_active_configuration_name() -> None:
     """Created documents must not assume the English ``Default`` name."""
     model = SimpleNamespace(
@@ -277,11 +365,10 @@ async def test_equation_operations_read_back_created_updated_and_deleted_rows() 
         Equation=get_equation,
         GlobalVariable=lambda index: "@" not in equations[index].split('"')[1],
         Add2=Mock(side_effect=add_equation),
-        SetEquationAndConfigurationOption=Mock(side_effect=set_equation),
         Delete=Mock(side_effect=delete_equation),
-        EvaluateAll=Mock(return_value=0),
+        SetEquationAndConfigurationOption=Mock(side_effect=set_equation),
     )
-    current_model = SimpleNamespace(GetEquationMgr=Mock(return_value=manager))
+    current_model = SimpleNamespace(GetEquationMgr=lambda: manager)
     harness = _IOHarness(current_model)
 
     listed = await harness.list_equations()
@@ -309,35 +396,98 @@ async def test_equation_operations_read_back_created_updated_and_deleted_rows() 
     }
     assert deleted.is_success
     assert deleted.data["name"] == "Clearance"
-    manager.SetEquationAndConfigurationOption.assert_called_once_with(
-        0, '"PlateWidth" = 120mm', 2, None
+    manager.SetEquationAndConfigurationOption.assert_not_called()
+    manager.Add2.assert_has_calls(
+        [
+            call(-1, '"PlateWidth" = 120mm', True),
+            call(-1, '"Clearance" = 0.25mm', True),
+        ]
     )
-    manager.Add2.assert_called_once_with(-1, '"Clearance" = 0.25mm', True)
-    manager.Delete.assert_called_once_with(1)
+    manager.Delete.assert_has_calls([call(0), call(1)])
 
 
 @pytest.mark.asyncio
-async def test_set_equation_rejects_a_com_update_that_keeps_the_old_expression() -> (
-    None
-):
-    """A rejected COM write cannot be reported as a successful equation update."""
+async def test_set_equation_replaces_existing_row_with_delete_and_add2() -> None:
+    """Existing equations update through the supported Delete/Add2 path."""
     equations = ['"PlateWidth" = 100mm']
+
+    def add_equation(_index: int, equation: str, _solve: bool) -> int:
+        equations.append(equation)
+        return len(equations) - 1
+
+    def delete_equation(index: int) -> int:
+        del equations[index]
+        return 0
+
     manager = SimpleNamespace(
         GetCount=lambda: len(equations),
         Equation=lambda index: equations[index],
         GlobalVariable=lambda _index: True,
         SetEquationAndConfigurationOption=Mock(return_value=1),
-        EvaluateAll=Mock(return_value=0),
+        Delete=Mock(side_effect=delete_equation),
+        Add2=Mock(side_effect=add_equation),
     )
-    current_model = SimpleNamespace(GetEquationMgr=Mock(return_value=manager))
+    current_model = SimpleNamespace(GetEquationMgr=lambda: manager)
     harness = _IOHarness(current_model)
 
     result = await harness.set_equation("PlateWidth", "120mm")
 
-    assert result.status is AdapterResultStatus.ERROR
-    assert result.error == "SolidWorks rejected the equation update"
-    assert equations == ['"PlateWidth" = 100mm']
-    manager.EvaluateAll.assert_not_called()
+    assert result.is_success
+    assert result.data["expression"] == "120mm"
+    assert equations == ['"PlateWidth" = 120mm']
+    manager.SetEquationAndConfigurationOption.assert_not_called()
+    manager.Delete.assert_called_once_with(0)
+    manager.Add2.assert_called_once_with(-1, '"PlateWidth" = 120mm', True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["exception", "rejected", "wrong_readback"])
+async def test_failed_equation_update_restores_original_row(failure: str) -> None:
+    equations = ['"PlateWidth" = 100mm', '"Height" = 50mm']
+
+    def add_equation(index, equation, _solve):
+        if equation == '"PlateWidth" = invalid':
+            if failure == "exception":
+                raise RuntimeError("COM failure")
+            if failure == "rejected":
+                return -1
+            equations.append('"PlateWidth" = 0mm')
+            return len(equations) - 1
+        equations.insert(index, equation)
+        return index
+
+    manager = SimpleNamespace(
+        GetCount=lambda: len(equations),
+        Equation=lambda index: equations[index],
+        GlobalVariable=lambda _index: True,
+        Delete=lambda index: equations.pop(index),
+        Add2=add_equation,
+    )
+    harness = _IOHarness(SimpleNamespace(GetEquationMgr=lambda: manager))
+
+    result = await harness.set_equation("PlateWidth", "invalid")
+
+    assert not result.is_success
+    assert equations == ['"PlateWidth" = 100mm', '"Height" = 50mm']
+
+
+@pytest.mark.asyncio
+async def test_equation_manager_accepts_callable_dispatch_returned_by_getattr() -> None:
+    """A callable COM manager property must not be called as a getter method."""
+
+    class CallableManager(SimpleNamespace):
+        def __call__(self):
+            raise AssertionError("manager default member called")
+
+    manager = CallableManager(GetCount=Mock(return_value=0), Equation=Mock())
+    model = SimpleNamespace(GetEquationMgr=manager)
+    harness = _IOHarness(model)
+
+    result = await harness.list_equations()
+
+    assert result.is_success
+    assert result.data == []
+    manager.GetCount.assert_called_once_with()
 
 
 @pytest.mark.asyncio
